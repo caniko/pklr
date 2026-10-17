@@ -90,8 +90,42 @@ pub(crate) fn write_atomic(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
     rename_result
 }
 
+/// Split the optional `::sha256:<hex>` checksum off a package URI's
+/// `name@version` part, returning the URI without it and the checksum.
+pub(super) fn split_package_checksum(uri: &str) -> Result<(String, Option<&str>)> {
+    let (location, fragment) = match uri.split_once('#') {
+        Some((location, fragment)) => (location, Some(fragment)),
+        None => (uri, None),
+    };
+    // The checksum follows the version, so search only after the last `@`;
+    // `::` can appear earlier in the host (IPv6 literals) or path.
+    let version_start = location.rfind('@').map_or(0, |at| at + 1);
+    let Some((version, checksum)) = location[version_start..].split_once("::") else {
+        return Ok((uri.to_string(), None));
+    };
+    let location = &location[..version_start + version.len()];
+    let valid = checksum
+        .strip_prefix("sha256:")
+        .is_some_and(|hex| hex.len() == 64 && hex.bytes().all(|b| b.is_ascii_hexdigit()));
+    if !valid {
+        return Err(Error::Eval(format!(
+            "invalid package checksum (expected `::sha256:<64 hex digits>`): {uri}"
+        )));
+    }
+    let stripped = match fragment {
+        Some(fragment) => format!("{location}#{fragment}"),
+        None => location.to_string(),
+    };
+    Ok((stripped, Some(checksum)))
+}
+
 /// Resolve a `package://` URI to a download source.
+///
+/// A `::sha256:<hex>` checksum after the version is ignored when locating the
+/// package; see [`split_package_checksum`] and `Evaluator::resolve_package`.
 pub(super) fn resolve_package_uri(uri: &str) -> Result<PackageSource> {
+    let (stripped, _checksum) = split_package_checksum(uri)?;
+    let uri = stripped.as_str();
     fn sanitize_package_entry(fragment: &str) -> Result<String> {
         if fragment.is_empty()
             || fragment.starts_with('/')
@@ -166,4 +200,13 @@ pub(super) fn resolve_package_uri(uri: &str) -> Result<PackageSource> {
         return Ok(PackageSource::Zip(zip_url, file_path));
     }
     Err(Error::Eval(format!("unsupported package URI: {uri}")))
+}
+
+/// Lowercase hex SHA-256 of `bytes`.
+pub(super) fn sha256_hex(bytes: &[u8]) -> String {
+    use sha2::Digest;
+    sha2::Sha256::digest(bytes)
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect()
 }
