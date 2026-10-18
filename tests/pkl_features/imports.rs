@@ -2203,16 +2203,22 @@ fn imported_class_retains_its_type_alias_constraint_bindings() {
                 "",
                 "local vendors = new Listing { \"caller\" }\ntypealias Vendor = Int\ntypealias VendorName = Boolean\n",
             ] {
-                std::fs::write(
-                    &main,
-                    format!(
-                        "import \"types.pkl\" as T\n{shadow}local selected = \"amd\"\nhost = new T.Host {{ vendor = selected }}\n"
-                    ),
-                )
-                .unwrap();
-                let value = pklr::eval_to_json(&main)
-                    .unwrap_or_else(|error| panic!("{vendors}, {default:?}, {shadow:?}: {error}"));
-                assert_eq!(value, serde_json::json!({"host": {"vendor": "amd"}}));
+                for body in ["vendor = selected", ""] {
+                    if body.is_empty() && default.is_empty() {
+                        continue;
+                    }
+                    std::fs::write(
+                        &main,
+                        format!(
+                            "import \"types.pkl\" as T\n{shadow}local selected = \"amd\"\nhost = new T.Host {{ {body} }}\n"
+                        ),
+                    )
+                    .unwrap();
+                    let value = pklr::eval_to_json(&main).unwrap_or_else(|error| {
+                        panic!("{vendors}, {default:?}, {shadow:?}, {body:?}: {error}")
+                    });
+                    assert_eq!(value, serde_json::json!({"host": {"vendor": "amd"}}));
+                }
             }
 
             std::fs::write(
