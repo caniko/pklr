@@ -637,40 +637,104 @@ pub(super) fn listing_property_order(entries: &[Entry]) -> Vec<usize> {
     order
 }
 
-// Mapping/object lambdas are rebound after the eager locals. Inspect their
-// earlier capture only when an eager initializer can actually use it, including
-// through another local function. Merely defining a lambda does not run it.
-fn early_local_lambda_refs(entries: &[Entry]) -> HashSet<String> {
+// Objects rebind local lambdas after output properties; Mappings do so before
+// output entries. Listings bind once in dependency order.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum BodyEvaluation {
+    Object,
+    Mapping,
+    Listing,
+}
+
+impl BodyEvaluation {
+    fn new(type_name: Option<&str>, entries: &[Entry]) -> Self {
+        match type_name {
+            Some("Mapping") => Self::Mapping,
+            Some("Listing") => Self::Listing,
+            None | Some("Dynamic") if is_element_only_body(entries) => Self::Listing,
+            _ => Self::Object,
+        }
+    }
+
+    fn inferred(ty: &crate::parser::TypeExpr, entries: &[Entry]) -> Self {
+        use crate::parser::TypeExpr;
+        match ty {
+            TypeExpr::Nullable(inner) => Self::inferred(inner, entries),
+            TypeExpr::Union(types) => types
+                .iter()
+                .find(|ty| is_default_type(ty))
+                .map_or(Self::Object, |ty| Self::inferred(ty, entries)),
+            TypeExpr::Named(name) | TypeExpr::Generic(name, _) | TypeExpr::Constrained(name, _) => {
+                let name = name.trim_start_matches('*').trim_end_matches('?');
+                Self::new(Some(name.split('<').next().unwrap_or(name)), entries)
+            }
+        }
+    }
+}
+
+// Inspect the first capture only when it can be used before rebinding, including
+// through stored aliases. Merely defining or copying a lambda does not run it.
+fn early_local_lambda_refs(entries: &[Entry], evaluation: BodyEvaluation) -> HashSet<String> {
     let mut refs = HashSet::default();
     if !entries.iter().any(|entry| matches!(entry, Entry::Property(prop)
         if has_modifier(&prop.modifiers, Modifier::Local) && matches!(prop.value, Some(Expr::Lambda(..)))))
     {
         return refs;
     }
+    let stored = stored_methods(entries, EagerReads::is_method);
+    let mut late_refs = HashSet::default();
     for entry in entries {
         match entry {
             Entry::Property(prop)
-                if has_modifier(&prop.modifiers, Modifier::Local)
-                    && !matches!(prop.value, Some(Expr::Lambda(..))) =>
+                if !matches!(prop.value, Some(Expr::Lambda(..)))
+                    && !stored.contains_key(prop.name.as_str()) =>
             {
+                let refs = if has_modifier(&prop.modifiers, Modifier::Local)
+                    || evaluation == BodyEvaluation::Object
+                {
+                    &mut refs
+                } else {
+                    &mut late_refs
+                };
                 if let Some(expr) = &prop.value {
-                    collect_expr_refs(expr, &mut refs, &HashSet::default());
+                    collect_expr_refs(expr, refs, &HashSet::default());
                 }
                 if let Some(body) = &prop.body {
-                    collect_entry_refs(body, &mut refs, &HashSet::default());
+                    collect_entry_refs(body, refs, &HashSet::default());
                 }
                 if let Some(ty) = &prop.type_ann {
-                    collect_type_names(ty, &mut refs);
+                    collect_type_names(ty, refs);
                 }
             }
+            Entry::Property(_) => {}
             Entry::ClassDef(_, _, _, body) => {
                 collect_entry_refs(body, &mut refs, &HashSet::default());
             }
-            _ => {}
+            _ => collect_entry_refs(
+                std::slice::from_ref(entry),
+                if evaluation == BodyEvaluation::Object {
+                    &mut refs
+                } else {
+                    &mut late_refs
+                },
+                &HashSet::default(),
+            ),
         }
     }
+    // A stored alias keeps the original closure even after its name is rebound.
+    refs.extend(
+        stored
+            .iter()
+            .filter(|(name, _)| late_refs.contains(**name))
+            .map(|(_, method)| method.to_string()),
+    );
     loop {
         let before = refs.len();
+        for (name, method) in &stored {
+            if refs.contains(*name) {
+                refs.insert(method.to_string());
+            }
+        }
         for entry in entries {
             if let Entry::Property(prop) = entry
                 && has_modifier(&prop.modifiers, Modifier::Local)
@@ -686,11 +750,6 @@ fn early_local_lambda_refs(entries: &[Entry]) -> HashSet<String> {
     }
 }
 
-fn new_body_is_listing(type_name: Option<&str>, entries: &[Entry]) -> bool {
-    type_name == Some("Listing")
-        || (matches!(type_name, None | Some("Dynamic")) && is_element_only_body(entries))
-}
-
 fn collect_sibling_field_refs_entries_in(
     entries: &[Entry],
     refs: &mut HashSet<String>,
@@ -700,7 +759,7 @@ fn collect_sibling_field_refs_entries_in(
         entries,
         refs,
         shadows,
-        is_element_only_body(entries),
+        BodyEvaluation::new(None, entries),
     );
 }
 
@@ -708,13 +767,14 @@ fn collect_sibling_field_refs_entries_ordered(
     entries: &[Entry],
     refs: &mut HashSet<String>,
     shadows: &HashSet<String>,
-    listing: bool,
+    evaluation: BodyEvaluation,
 ) {
+    let listing = evaluation == BodyEvaluation::Listing;
     let mut entry_shadows = shadows.clone();
     let early_lambdas = if listing {
         HashSet::default()
     } else {
-        early_local_lambda_refs(entries)
+        early_local_lambda_refs(entries, evaluation)
     };
     let order = listing.then(|| listing_property_order(entries));
     for entry in order
@@ -725,6 +785,19 @@ fn collect_sibling_field_refs_entries_ordered(
     {
         match entry {
             Entry::Property(prop) if listing || has_modifier(&prop.modifiers, Modifier::Local) => {
+                if listing
+                    && let Some(expr) = &prop.value
+                    && expr_mentions(expr, "super")
+                {
+                    // Endpoint reads re-enter the member walk in this partial
+                    // scope, not the completed dependency-ordered scope.
+                    collect_sibling_field_refs_entries_ordered(
+                        &reentrant_listing_reads(entries, expr),
+                        refs,
+                        &entry_shadows,
+                        BodyEvaluation::Object,
+                    );
+                }
                 if let Some(ty) = &prop.type_ann {
                     collect_sibling_field_refs_type_in(ty, refs, &entry_shadows);
                 }
@@ -817,7 +890,7 @@ fn collect_sibling_field_refs_entries_ordered(
                     &fgen.body,
                     refs,
                     &body_shadows,
-                    listing,
+                    evaluation,
                 );
             }
             Entry::WhenGenerator(wgen) => {
@@ -826,14 +899,14 @@ fn collect_sibling_field_refs_entries_ordered(
                     &wgen.body,
                     refs,
                     &entry_shadows,
-                    listing,
+                    evaluation,
                 );
                 if let Some(else_body) = &wgen.else_body {
                     collect_sibling_field_refs_entries_ordered(
                         else_body,
                         refs,
                         &entry_shadows,
-                        listing,
+                        evaluation,
                     );
                 }
             }
@@ -1264,7 +1337,7 @@ fn collect_sibling_field_refs_expr_in(
                 entries,
                 refs,
                 shadows,
-                new_body_is_listing(type_name.as_deref(), entries),
+                BodyEvaluation::new(type_name.as_deref(), entries),
             );
         }
         Expr::InferredNew(ty, entries) => {
@@ -1272,7 +1345,7 @@ fn collect_sibling_field_refs_expr_in(
                 entries,
                 refs,
                 shadows,
-                type_is_listing(ty) || is_element_only_body(entries),
+                BodyEvaluation::inferred(ty, entries),
             );
         }
         Expr::ObjectBody(entries) => {
@@ -1905,10 +1978,21 @@ fn referenced_roots_of(entries: &[&Entry]) -> HashSet<String> {
     refs
 }
 
-/// The properties of a class `body` that store one of its methods (those
-/// `is_method` accepts) rather than compute a value (`callback = getMin` or
-/// `= this.getMin`), with the method each stores.
+/// The properties and locals of `body` that only store a method (one accepted
+/// by `is_method`), including alias chains and identity lets.
 fn stored_methods(body: &[Entry], is_method: fn(&Entry) -> bool) -> HashMap<&str, &str> {
+    fn stored_name(expr: &Expr) -> Option<&str> {
+        match expr {
+            Expr::Ident(name) => Some(name),
+            Expr::Field(base, name) if matches!(&**base, Expr::Ident(this) if this == "this") => {
+                Some(name)
+            }
+            Expr::Let(name, value, result) if matches!(&**result, Expr::Ident(result) if result == name) => {
+                stored_name(value)
+            }
+            _ => None,
+        }
+    }
     let methods: HashSet<&str> = body
         .iter()
         .filter_map(|entry| match entry {
@@ -1916,23 +2000,24 @@ fn stored_methods(body: &[Entry], is_method: fn(&Entry) -> bool) -> HashMap<&str
             _ => None,
         })
         .collect();
-    body.iter()
-        .filter_map(|entry| match entry {
-            Entry::Property(prop) if !has_modifier(&prop.modifiers, Modifier::Local) => {
-                let method = match prop.value.as_ref()? {
-                    Expr::Ident(name) => name,
-                    Expr::Field(base, name) if matches!(&**base, Expr::Ident(this) if this == "this") => {
-                        name
-                    }
-                    _ => return None,
-                };
-                methods
-                    .contains(method.as_str())
-                    .then_some((prop.name.as_str(), method.as_str()))
+    let mut stored = HashMap::default();
+    loop {
+        let before = stored.len();
+        for entry in body {
+            if let Entry::Property(prop) = entry
+                && let Some(name) = prop.value.as_ref().and_then(stored_name)
+                && let Some(method) = methods
+                    .get(name)
+                    .copied()
+                    .or_else(|| stored.get(name).copied())
+            {
+                stored.insert(prop.name.as_str(), method);
             }
-            _ => None,
-        })
-        .collect()
+        }
+        if stored.len() == before {
+            return stored;
+        }
+    }
 }
 
 /// The names a class body's defaults read from its enclosing scope while
@@ -2436,7 +2521,7 @@ fn collect_entry_refs_in(
         shadows,
         aliases,
         definitions,
-        is_element_only_body(entries),
+        BodyEvaluation::new(None, entries),
     );
 }
 
@@ -2446,7 +2531,7 @@ fn collect_entry_refs_ordered(
     shadows: &Names,
     aliases: Option<&TypeAliases>,
     definitions: Option<&Definitions>,
-    listing: bool,
+    evaluation: BodyEvaluation,
 ) {
     // A type alias or class declared in this body takes effect only from its
     // declaration on (a local evaluated earlier still sees the module's
@@ -2479,7 +2564,7 @@ fn collect_entry_refs_ordered(
             shadows,
             Some(narrowed),
             Some(definitions),
-            listing,
+            evaluation,
         );
         follow_definitions(definitions, &mut body_refs, Some(narrowed));
         let followed: HashSet<String> = definitions
@@ -2499,7 +2584,7 @@ fn collect_entry_refs_ordered(
         shadows,
         narrowed.as_ref().or(aliases),
         definitions,
-        listing,
+        evaluation,
     );
 }
 
@@ -2518,7 +2603,7 @@ fn collect_entry_refs_unnarrowed(
         shadows,
         aliases,
         definitions,
-        is_element_only_body(entries),
+        BodyEvaluation::new(None, entries),
     );
 }
 
@@ -2528,15 +2613,16 @@ fn collect_entry_refs_unnarrowed_ordered(
     shadows: &Names,
     aliases: Option<&TypeAliases>,
     definitions: Option<&Definitions>,
-    listing: bool,
+    evaluation: BodyEvaluation,
 ) {
+    let listing = evaluation == BodyEvaluation::Listing;
     let mut initializer_shadows = std::borrow::Cow::Borrowed(shadows);
     let mut entry_shadows = shadows.clone();
     entry_shadows.extend(declared_entry_names(entries));
     let early_lambdas = if listing {
         HashSet::default()
     } else {
-        early_local_lambda_refs(entries)
+        early_local_lambda_refs(entries, evaluation)
     };
     let order = listing.then(|| listing_property_order(entries));
     for entry in order
@@ -2547,6 +2633,19 @@ fn collect_entry_refs_unnarrowed_ordered(
     {
         match entry {
             Entry::Property(prop) if listing || has_modifier(&prop.modifiers, Modifier::Local) => {
+                if listing
+                    && let Some(expr) = &prop.value
+                    && expr_mentions(expr, "super")
+                {
+                    collect_entry_refs_ordered(
+                        &reentrant_listing_reads(entries, expr),
+                        refs,
+                        &initializer_shadows,
+                        aliases,
+                        definitions,
+                        BodyEvaluation::Object,
+                    );
+                }
                 if let Some(ty) = &prop.type_ann {
                     collect_type_refs(ty, refs, &initializer_shadows, aliases, definitions);
                 }
@@ -2610,7 +2709,7 @@ fn collect_entry_refs_unnarrowed_ordered(
                     &body_shadows,
                     aliases,
                     definitions,
-                    listing,
+                    evaluation,
                 );
             }
             Entry::WhenGenerator(wgen) => {
@@ -2621,7 +2720,7 @@ fn collect_entry_refs_unnarrowed_ordered(
                     &entry_shadows,
                     aliases,
                     definitions,
-                    listing,
+                    evaluation,
                 );
                 if let Some(else_body) = &wgen.else_body {
                     collect_entry_refs_ordered(
@@ -2630,7 +2729,7 @@ fn collect_entry_refs_unnarrowed_ordered(
                         &entry_shadows,
                         aliases,
                         definitions,
-                        listing,
+                        evaluation,
                     );
                 }
             }
@@ -2648,6 +2747,73 @@ fn collect_entry_refs_unnarrowed_ordered(
             }
         }
     }
+}
+
+fn reentrant_listing_reads(entries: &[Entry], initializer: &Expr) -> Vec<Entry> {
+    let mut fields = HashSet::default();
+    collect_field_names_expr(initializer, &mut fields);
+    let first = fields.contains("first");
+    let last = fields.contains("last");
+    if !first && !last {
+        return Vec::new();
+    }
+    let mut reads = listing_endpoint_entries(entries, &[]);
+    if reads.iter().all(|entry| matches!(entry, Entry::Elem(_))) {
+        let last = last.then(|| reads.pop()).flatten();
+        let first = first.then(|| reads.into_iter().next()).flatten();
+        return first.into_iter().chain(last).collect();
+    }
+    // ponytail: generated/spread/indexed endpoint positions are unknown here;
+    // retain all possible reads until static cardinality tracking is needed.
+    reads
+}
+
+// Model eval_listing_member's declaration-order, demand-wrapped locals for a
+// reentrant endpoint read, including possible generator endpoints.
+fn listing_endpoint_entries(entries: &[Entry], inherited_locals: &[(String, Expr)]) -> Vec<Entry> {
+    let mut locals = inherited_locals.to_vec();
+    let mut reads = Vec::new();
+    for entry in entries {
+        match entry {
+            Entry::Property(prop) if has_modifier(&prop.modifiers, Modifier::Local) => {
+                if let Some(expr) = &prop.value {
+                    locals.push((prop.name.clone(), expr.clone()));
+                }
+            }
+            Entry::Elem(expr) => reads.push(Entry::Elem(with_listing_locals(expr, &locals))),
+            Entry::DynProperty(key, expr) => reads.push(Entry::DynProperty(
+                key.clone(),
+                with_listing_locals(expr, &locals),
+            )),
+            Entry::ForGenerator(generator) => {
+                let mut generator = generator.clone();
+                let mut iter_locals = locals.clone();
+                // As in eval_listing_member, bind variables after inherited
+                // locals. Unknown endpoint items retain module dependencies.
+                iter_locals.push((
+                    generator.val_var.clone(),
+                    Expr::Ident("\0endpoint_value".into()),
+                ));
+                if let Some(key) = &generator.key_var {
+                    iter_locals.push((key.clone(), Expr::Int(0)));
+                }
+                generator.body = listing_endpoint_entries(&generator.body, &iter_locals).into();
+                reads.push(Entry::ForGenerator(generator));
+            }
+            Entry::WhenGenerator(generator) => {
+                let mut generator = generator.clone();
+                generator.body = listing_endpoint_entries(&generator.body, &locals).into();
+                generator.else_body = generator
+                    .else_body
+                    .as_ref()
+                    .map(|body| listing_endpoint_entries(body, &locals).into());
+                reads.push(Entry::WhenGenerator(generator));
+            }
+            Entry::Spread(_) => reads.push(entry.clone()),
+            _ => {}
+        }
+    }
+    reads
 }
 
 // Wrap only the locals needed by the selected element. Forcing unrelated
@@ -2718,7 +2884,7 @@ fn collect_expr_refs_in(
                 shadows,
                 aliases,
                 definitions,
-                new_body_is_listing(type_name.as_deref(), entries),
+                BodyEvaluation::new(type_name.as_deref(), entries),
             );
         }
         Expr::Field(base, _) | Expr::NullSafeField(base, _) => {
@@ -2770,7 +2936,7 @@ fn collect_expr_refs_in(
                 shadows,
                 aliases,
                 definitions,
-                type_is_listing(ty) || is_element_only_body(entries),
+                BodyEvaluation::inferred(ty, entries),
             );
         }
         Expr::ObjectBody(entries) => {
