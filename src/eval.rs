@@ -5896,7 +5896,25 @@ impl Evaluator {
         // A different binding with the same name must not replace a free name
         // used by an inherited entry: those names are lexically bound where
         // the base object was defined, not where it is amended.
-        let inherited_references = self.body_referenced_roots(base_entries);
+        let mut inherited_references = self.body_referenced_roots(base_entries);
+        // An inherited annotation also reads the free names in the aliases it
+        // reaches. Keep those definition-site bindings when the caller has an
+        // unrelated value (or module) of the same name. The reference set also
+        // guards recursive aliases while following them transitively.
+        let mut pending: Vec<String> = inherited_references
+            .iter()
+            .filter(|name| base_type_aliases.contains_key(name.as_str()))
+            .cloned()
+            .collect();
+        while let Some(name) = pending.pop() {
+            if let Some(ty) = base_type_aliases.get(name.as_str()) {
+                for root in type_reference_names(ty) {
+                    if Arc::make_mut(&mut inherited_references).insert(root.clone()) {
+                        pending.push(root);
+                    }
+                }
+            }
+        }
         let mut preserved_inherited_bindings = HashSet::default();
         // The amendment's captured scope is `current_scope` flattened, plus
         // the `super` binding skipped here.
