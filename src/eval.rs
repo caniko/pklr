@@ -6482,31 +6482,13 @@ impl Evaluator {
         // its entries, including ones written before them, and to each other
         // regardless of order. Bind each once the members of this body it
         // reads are bound, so a function captures them too.
-        let mut pending: Vec<_> = entries
-            .iter()
-            .filter_map(|entry| match entry {
-                Entry::Property(prop) => Some((prop, prop.value.as_ref()?)),
-                _ => None,
-            })
-            .collect();
-        let mut unbound: HashSet<String> =
-            pending.iter().map(|(prop, _)| prop.name.clone()).collect();
-        while !pending.is_empty() {
-            let ready = pending
-                .iter()
-                .position(|(prop, expr)| {
-                    let mut refs = HashSet::default();
-                    collect_expr_refs(expr, &mut refs, &HashSet::default());
-                    !refs
-                        .iter()
-                        .any(|name| *name != prop.name && unbound.contains(name))
-                })
-                // A cycle: bind in declaration order.
-                .unwrap_or(0);
-            let (prop, expr) = pending.remove(ready);
-            let value = self.eval_expr(expr, &listing_scope, depth + 1)?;
-            bind_listing_member(&mut listing_scope, prop, value);
-            unbound.remove(&prop.name);
+        for index in listing_property_order(entries) {
+            if let Entry::Property(prop) = &entries[index]
+                && let Some(expr) = &prop.value
+            {
+                let value = self.eval_expr(expr, &listing_scope, depth + 1)?;
+                bind_listing_member(&mut listing_scope, prop, value);
+            }
         }
         for entry in entries {
             match entry {

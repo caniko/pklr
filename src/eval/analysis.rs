@@ -601,32 +601,138 @@ pub(super) fn collect_sibling_field_refs_entries(entries: &[Entry], refs: &mut H
     collect_sibling_field_refs_entries_in(entries, refs, &HashSet::default());
 }
 
+// Match eval_listing_entries: dependencies precede their readers, while cycles
+// fall back to declaration order. Share the order with dependency analysis.
+pub(super) fn listing_property_order(entries: &[Entry]) -> Vec<usize> {
+    let mut pending: Vec<_> = entries
+        .iter()
+        .enumerate()
+        .filter_map(|(index, entry)| match entry {
+            Entry::Property(prop) => Some((index, prop, prop.value.as_ref()?)),
+            _ => None,
+        })
+        .collect();
+    let mut unbound: HashSet<String> = pending
+        .iter()
+        .map(|(_, prop, _)| prop.name.clone())
+        .collect();
+    let mut order = Vec::with_capacity(pending.len());
+    // ponytail: preserve the runtime's quadratic scan for small Listing bodies;
+    // a dependency graph can replace it if large local sets become common.
+    while !pending.is_empty() {
+        let ready = pending
+            .iter()
+            .position(|(_, prop, expr)| {
+                let mut refs = HashSet::default();
+                collect_expr_refs(expr, &mut refs, &HashSet::default());
+                !refs
+                    .iter()
+                    .any(|name| *name != prop.name && unbound.contains(name))
+            })
+            .unwrap_or(0);
+        let (index, prop, _) = pending.remove(ready);
+        unbound.remove(&prop.name);
+        order.push(index);
+    }
+    order
+}
+
+// Mapping/object lambdas are rebound after the eager locals. Inspect their
+// earlier capture only when an eager initializer can actually use it, including
+// through another local function. Merely defining a lambda does not run it.
+fn early_local_lambda_refs(entries: &[Entry]) -> HashSet<String> {
+    let mut refs = HashSet::default();
+    if !entries.iter().any(|entry| matches!(entry, Entry::Property(prop)
+        if has_modifier(&prop.modifiers, Modifier::Local) && matches!(prop.value, Some(Expr::Lambda(..)))))
+    {
+        return refs;
+    }
+    for entry in entries {
+        match entry {
+            Entry::Property(prop)
+                if has_modifier(&prop.modifiers, Modifier::Local)
+                    && !matches!(prop.value, Some(Expr::Lambda(..))) =>
+            {
+                if let Some(expr) = &prop.value {
+                    collect_expr_refs(expr, &mut refs, &HashSet::default());
+                }
+                if let Some(body) = &prop.body {
+                    collect_entry_refs(body, &mut refs, &HashSet::default());
+                }
+                if let Some(ty) = &prop.type_ann {
+                    collect_type_names(ty, &mut refs);
+                }
+            }
+            Entry::ClassDef(_, _, _, body) => {
+                collect_entry_refs(body, &mut refs, &HashSet::default());
+            }
+            _ => {}
+        }
+    }
+    loop {
+        let before = refs.len();
+        for entry in entries {
+            if let Entry::Property(prop) = entry
+                && has_modifier(&prop.modifiers, Modifier::Local)
+                && refs.contains(&prop.name)
+                && let Some(expr @ Expr::Lambda(..)) = &prop.value
+            {
+                collect_expr_refs(expr, &mut refs, &HashSet::default());
+            }
+        }
+        if refs.len() == before {
+            return refs;
+        }
+    }
+}
+
+fn new_body_is_listing(type_name: Option<&str>, entries: &[Entry]) -> bool {
+    type_name == Some("Listing")
+        || (matches!(type_name, None | Some("Dynamic")) && is_element_only_body(entries))
+}
+
 fn collect_sibling_field_refs_entries_in(
     entries: &[Entry],
     refs: &mut HashSet<String>,
     shadows: &HashSet<String>,
 ) {
+    collect_sibling_field_refs_entries_ordered(
+        entries,
+        refs,
+        shadows,
+        is_element_only_body(entries),
+    );
+}
+
+fn collect_sibling_field_refs_entries_ordered(
+    entries: &[Entry],
+    refs: &mut HashSet<String>,
+    shadows: &HashSet<String>,
+    listing: bool,
+) {
     let mut entry_shadows = shadows.clone();
-    // An inherited binding says nothing about a same-named binding in this
-    // body: Listing locals can be evaluated out of declaration order.
-    if !entry_shadows.is_empty() {
-        let declared = declared_entry_names(entries);
-        entry_shadows.retain(|name| !declared.values.contains(name));
-    }
-    // Scan initializers before adding their binding. Lambda locals can be
-    // called then and are also rebound after the locals, so collect their
-    // bodies in both capture scopes.
-    for entry in entries {
+    let early_lambdas = if listing {
+        HashSet::default()
+    } else {
+        early_local_lambda_refs(entries)
+    };
+    let order = listing.then(|| listing_property_order(entries));
+    for entry in order
+        .iter()
+        .flatten()
+        .map(|&index| &entries[index])
+        .chain(entries.iter().filter(|_| !listing))
+    {
         match entry {
-            Entry::Property(prop) if has_modifier(&prop.modifiers, Modifier::Local) => {
-                // The initializer can still read its own outer binding.
-                if shadows.contains(&prop.name) {
-                    entry_shadows.insert(prop.name.clone());
-                }
+            Entry::Property(prop) if listing || has_modifier(&prop.modifiers, Modifier::Local) => {
                 if let Some(ty) = &prop.type_ann {
                     collect_sibling_field_refs_type_in(ty, refs, &entry_shadows);
                 }
-                if let Some(expr) = &prop.value {
+                if let Some(expr) = &prop.value
+                    && (listing
+                        || !matches!(expr, Expr::Lambda(..))
+                        || early_lambdas.contains(&prop.name))
+                {
                     collect_sibling_field_refs_expr_in(expr, refs, false, &entry_shadows);
                 }
                 if let Some(body) = &prop.body {
@@ -647,8 +753,9 @@ fn collect_sibling_field_refs_entries_in(
                 collect_sibling_field_refs_entries_in(body, refs, &entry_shadows);
                 entry_shadows.insert(name.clone());
             }
-            Entry::Property(prop) if matches!(prop.value, Some(Expr::Lambda(..))) => {
-                entry_shadows.insert(prop.name.clone());
+            Entry::Property(prop) => {
+                // An overridable property may be amended to the real module.
+                entry_shadows.remove(&prop.name);
             }
             _ => {}
         }
@@ -656,8 +763,9 @@ fn collect_sibling_field_refs_entries_in(
     for entry in entries {
         match entry {
             Entry::Property(prop)
-                if has_modifier(&prop.modifiers, Modifier::Local)
-                    && !matches!(prop.value, Some(Expr::Lambda(..))) => {}
+                if listing
+                    || (has_modifier(&prop.modifiers, Modifier::Local)
+                        && !matches!(prop.value, Some(Expr::Lambda(..)))) => {}
             Entry::Property(prop) => {
                 if let Some(ty) = &prop.type_ann {
                     collect_sibling_field_refs_type_in(ty, refs, &entry_shadows);
@@ -705,13 +813,28 @@ fn collect_sibling_field_refs_entries_in(
                     // collection_to_items always binds an integer or string key.
                     body_shadows.insert(key_var.clone());
                 }
-                collect_sibling_field_refs_entries_in(&fgen.body, refs, &body_shadows);
+                collect_sibling_field_refs_entries_ordered(
+                    &fgen.body,
+                    refs,
+                    &body_shadows,
+                    listing,
+                );
             }
             Entry::WhenGenerator(wgen) => {
                 collect_sibling_field_refs_expr_in(&wgen.condition, refs, false, &entry_shadows);
-                collect_sibling_field_refs_entries_in(&wgen.body, refs, &entry_shadows);
+                collect_sibling_field_refs_entries_ordered(
+                    &wgen.body,
+                    refs,
+                    &entry_shadows,
+                    listing,
+                );
                 if let Some(else_body) = &wgen.else_body {
-                    collect_sibling_field_refs_entries_in(else_body, refs, &entry_shadows);
+                    collect_sibling_field_refs_entries_ordered(
+                        else_body,
+                        refs,
+                        &entry_shadows,
+                        listing,
+                    );
                 }
             }
             Entry::Spread(expr) | Entry::Elem(expr) => {
@@ -1137,9 +1260,22 @@ fn collect_sibling_field_refs_expr_in(
                 let member = rest.split('.').next().unwrap_or(rest);
                 refs.insert(member.to_string());
             }
-            collect_sibling_field_refs_entries_in(entries, refs, shadows);
+            collect_sibling_field_refs_entries_ordered(
+                entries,
+                refs,
+                shadows,
+                new_body_is_listing(type_name.as_deref(), entries),
+            );
         }
-        Expr::InferredNew(_, entries) | Expr::ObjectBody(entries) => {
+        Expr::InferredNew(ty, entries) => {
+            collect_sibling_field_refs_entries_ordered(
+                entries,
+                refs,
+                shadows,
+                type_is_listing(ty) || is_element_only_body(entries),
+            );
+        }
+        Expr::ObjectBody(entries) => {
             collect_sibling_field_refs_entries_in(entries, refs, shadows);
         }
         Expr::Call(callee, args) => {
@@ -2294,6 +2430,24 @@ fn collect_entry_refs_in(
     aliases: Option<&TypeAliases>,
     definitions: Option<&Definitions>,
 ) {
+    collect_entry_refs_ordered(
+        entries,
+        refs,
+        shadows,
+        aliases,
+        definitions,
+        is_element_only_body(entries),
+    );
+}
+
+fn collect_entry_refs_ordered(
+    entries: &[Entry],
+    refs: &mut Names,
+    shadows: &Names,
+    aliases: Option<&TypeAliases>,
+    definitions: Option<&Definitions>,
+    listing: bool,
+) {
     // A type alias or class declared in this body takes effect only from its
     // declaration on (a local evaluated earlier still sees the module's
     // aliases), and it can change what a module alias's definition refers to
@@ -2319,12 +2473,13 @@ fn collect_entry_refs_in(
     // property).
     if let (Some(narrowed), Some(definitions)) = (&narrowed, definitions) {
         let mut body_refs = Names::default();
-        collect_entry_refs_unnarrowed(
+        collect_entry_refs_unnarrowed_ordered(
             entries,
             &mut body_refs,
             shadows,
             Some(narrowed),
             Some(definitions),
+            listing,
         );
         follow_definitions(definitions, &mut body_refs, Some(narrowed));
         let followed: HashSet<String> = definitions
@@ -2338,12 +2493,13 @@ fn collect_entry_refs_in(
         refs.extend(body_refs);
         return;
     }
-    collect_entry_refs_unnarrowed(
+    collect_entry_refs_unnarrowed_ordered(
         entries,
         refs,
         shadows,
         narrowed.as_ref().or(aliases),
         definitions,
+        listing,
     );
 }
 
@@ -2356,31 +2512,85 @@ fn collect_entry_refs_unnarrowed(
     aliases: Option<&TypeAliases>,
     definitions: Option<&Definitions>,
 ) {
+    collect_entry_refs_unnarrowed_ordered(
+        entries,
+        refs,
+        shadows,
+        aliases,
+        definitions,
+        is_element_only_body(entries),
+    );
+}
+
+fn collect_entry_refs_unnarrowed_ordered(
+    entries: &[Entry],
+    refs: &mut Names,
+    shadows: &Names,
+    aliases: Option<&TypeAliases>,
+    definitions: Option<&Definitions>,
+    listing: bool,
+) {
+    let mut initializer_shadows = std::borrow::Cow::Borrowed(shadows);
     let mut entry_shadows = shadows.clone();
     entry_shadows.extend(declared_entry_names(entries));
-    for entry in entries {
+    let early_lambdas = if listing {
+        HashSet::default()
+    } else {
+        early_local_lambda_refs(entries)
+    };
+    let order = listing.then(|| listing_property_order(entries));
+    for entry in order
+        .iter()
+        .flatten()
+        .map(|&index| &entries[index])
+        .chain(entries.iter().filter(|_| !listing))
+    {
         match entry {
-            Entry::Property(prop) => {
-                // A local's own name is not bound during its initializer.
-                // Keep sibling bindings: Listing locals are dependency-ordered,
-                // and deferred lambdas capture the completed body scope.
-                let initializer_shadows = (has_modifier(&prop.modifiers, Modifier::Local)
-                    && !matches!(prop.value, Some(Expr::Lambda(..)))
-                    && !shadows.values.contains(&prop.name))
-                .then(|| {
-                    let mut initializer_shadows = entry_shadows.clone();
-                    initializer_shadows.values.remove(&prop.name);
-                    initializer_shadows
-                });
-                let property_shadows = initializer_shadows.as_ref().unwrap_or(&entry_shadows);
+            Entry::Property(prop) if listing || has_modifier(&prop.modifiers, Modifier::Local) => {
                 if let Some(ty) = &prop.type_ann {
-                    collect_type_refs(ty, refs, property_shadows, aliases, definitions);
+                    collect_type_refs(ty, refs, &initializer_shadows, aliases, definitions);
                 }
-                if let Some(expr) = &prop.value {
-                    collect_expr_refs_in(expr, refs, property_shadows, aliases, definitions);
+                if let Some(expr) = &prop.value
+                    && (listing
+                        || !matches!(expr, Expr::Lambda(..))
+                        || early_lambdas.contains(&prop.name))
+                {
+                    collect_expr_refs_in(expr, refs, &initializer_shadows, aliases, definitions);
                 }
                 if let Some(body) = &prop.body {
-                    collect_entry_refs_in(body, refs, property_shadows, aliases, definitions);
+                    collect_entry_refs_in(body, refs, &initializer_shadows, aliases, definitions);
+                }
+                initializer_shadows
+                    .to_mut()
+                    .values
+                    .insert(prop.name.clone());
+            }
+            Entry::ClassDef(name, ..) => {
+                let initializer_shadows = initializer_shadows.to_mut();
+                initializer_shadows.values.insert(name.clone());
+                initializer_shadows.types.insert(name.clone());
+            }
+            Entry::TypeAlias(name, _) => {
+                initializer_shadows.to_mut().types.insert(name.clone());
+            }
+            _ => {}
+        }
+    }
+    for entry in entries {
+        match entry {
+            Entry::Property(prop)
+                if listing
+                    || (has_modifier(&prop.modifiers, Modifier::Local)
+                        && !matches!(prop.value, Some(Expr::Lambda(..)))) => {}
+            Entry::Property(prop) => {
+                if let Some(ty) = &prop.type_ann {
+                    collect_type_refs(ty, refs, &entry_shadows, aliases, definitions);
+                }
+                if let Some(expr) = &prop.value {
+                    collect_expr_refs_in(expr, refs, &entry_shadows, aliases, definitions);
+                }
+                if let Some(body) = &prop.body {
+                    collect_entry_refs_in(body, refs, &entry_shadows, aliases, definitions);
                 }
             }
             Entry::DynProperty(key, value) | Entry::Predicate(key, value) => {
@@ -2394,13 +2604,34 @@ fn collect_entry_refs_unnarrowed(
                 if let Some(key_var) = &fgen.key_var {
                     body_shadows.values.insert(key_var.clone());
                 }
-                collect_entry_refs_in(&fgen.body, refs, &body_shadows, aliases, definitions);
+                collect_entry_refs_ordered(
+                    &fgen.body,
+                    refs,
+                    &body_shadows,
+                    aliases,
+                    definitions,
+                    listing,
+                );
             }
             Entry::WhenGenerator(wgen) => {
                 collect_expr_refs_in(&wgen.condition, refs, &entry_shadows, aliases, definitions);
-                collect_entry_refs_in(&wgen.body, refs, &entry_shadows, aliases, definitions);
+                collect_entry_refs_ordered(
+                    &wgen.body,
+                    refs,
+                    &entry_shadows,
+                    aliases,
+                    definitions,
+                    listing,
+                );
                 if let Some(else_body) = &wgen.else_body {
-                    collect_entry_refs_in(else_body, refs, &entry_shadows, aliases, definitions);
+                    collect_entry_refs_ordered(
+                        else_body,
+                        refs,
+                        &entry_shadows,
+                        aliases,
+                        definitions,
+                        listing,
+                    );
                 }
             }
             Entry::Spread(expr) | Entry::Elem(expr) => {
@@ -2481,7 +2712,14 @@ fn collect_expr_refs_in(
             for param in generic_params {
                 collect_name_root(param, refs, shadows);
             }
-            collect_entry_refs_in(entries, refs, shadows, aliases, definitions);
+            collect_entry_refs_ordered(
+                entries,
+                refs,
+                shadows,
+                aliases,
+                definitions,
+                new_body_is_listing(type_name.as_deref(), entries),
+            );
         }
         Expr::Field(base, _) | Expr::NullSafeField(base, _) => {
             collect_expr_refs_in(base, refs, shadows, aliases, definitions);
@@ -2526,7 +2764,14 @@ fn collect_expr_refs_in(
         }
         Expr::InferredNew(ty, entries) => {
             collect_type_refs(ty, refs, shadows, aliases, definitions);
-            collect_entry_refs_in(entries, refs, shadows, aliases, definitions);
+            collect_entry_refs_ordered(
+                entries,
+                refs,
+                shadows,
+                aliases,
+                definitions,
+                type_is_listing(ty) || is_element_only_body(entries),
+            );
         }
         Expr::ObjectBody(entries) => {
             collect_entry_refs_in(entries, refs, shadows, aliases, definitions)
