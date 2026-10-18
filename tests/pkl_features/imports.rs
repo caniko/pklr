@@ -2233,6 +2233,41 @@ fn imported_class_retains_its_type_alias_constraint_bindings() {
 }
 
 #[test]
+fn narrowed_import_ignores_shadowed_module_receivers_in_constraints() {
+    let temp = TestTempDir::new("pklr_test_narrowed_import_shadowed_module");
+    let dir = temp.path();
+    std::fs::write(
+        dir.join("main.pkl"),
+        "import \"dep.pkl\" as Dep\nresult = new Dep.C {}\n",
+    )
+    .unwrap();
+    for access in [
+        "`module`.bad",
+        "`module`?.bad",
+        "`module`[\"bad\"]",
+        "`module`[\"b\" + \"ad\"]",
+        "(new Dynamic { value = `module`.bad }).value",
+        "(true is Boolean(`module`.bad))",
+    ] {
+        for constraint in [
+            format!("let (`module` = new Dynamic {{ bad = module.good }}) {access}"),
+            format!("((`module`) -> {access})(new Dynamic {{ bad = module.good }})"),
+        ] {
+            std::fs::write(
+                dir.join("dep.pkl"),
+                format!(
+                    "bad = import(\"missing.pkl\")\ngood = true\ntypealias Check = Boolean({constraint})\nclass C {{ ok: Check = true }}\n"
+                ),
+            )
+            .unwrap();
+            let value = pklr::eval_to_json(&dir.join("main.pkl"))
+                .unwrap_or_else(|error| panic!("{constraint}: {error}"));
+            assert_eq!(value, serde_json::json!({"result": {"ok": true}}));
+        }
+    }
+}
+
+#[test]
 fn narrowed_import_ignores_class_properties_named_like_module_properties() {
     let temp = TestTempDir::new("pklr_test_narrowed_import_class_property_shadow");
     let dir = temp.path();

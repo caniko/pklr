@@ -598,39 +598,56 @@ fn follow_definitions(definitions: &Definitions, refs: &mut Names, aliases: Opti
 }
 
 pub(super) fn collect_sibling_field_refs_entries(entries: &[Entry], refs: &mut HashSet<String>) {
+    collect_sibling_field_refs_entries_in(entries, refs, &HashSet::default());
+}
+
+fn collect_sibling_field_refs_entries_in(
+    entries: &[Entry],
+    refs: &mut HashSet<String>,
+    shadows: &HashSet<String>,
+) {
+    let mut entry_shadows = shadows.clone();
+    entry_shadows.extend(declared_entry_names(entries).values);
     for entry in entries {
         match entry {
             Entry::Property(prop) => {
                 if let Some(ty) = &prop.type_ann {
-                    collect_sibling_field_refs_type(ty, refs);
+                    collect_sibling_field_refs_type_in(ty, refs, &entry_shadows);
                 }
                 if let Some(expr) = &prop.value {
-                    collect_sibling_field_refs_expr(expr, refs, false);
+                    collect_sibling_field_refs_expr_in(expr, refs, false, &entry_shadows);
                 }
                 if let Some(body) = &prop.body {
-                    collect_sibling_field_refs_entries(body, refs);
+                    collect_sibling_field_refs_entries_in(body, refs, &entry_shadows);
                 }
             }
             Entry::DynProperty(key, value) | Entry::Predicate(key, value) => {
-                collect_sibling_field_refs_expr(key, refs, false);
-                collect_sibling_field_refs_expr(value, refs, false);
+                collect_sibling_field_refs_expr_in(key, refs, false, &entry_shadows);
+                collect_sibling_field_refs_expr_in(value, refs, false, &entry_shadows);
             }
             Entry::ForGenerator(fgen) => {
-                collect_sibling_field_refs_expr(&fgen.collection, refs, false);
-                collect_sibling_field_refs_entries(&fgen.body, refs);
+                collect_sibling_field_refs_expr_in(&fgen.collection, refs, false, &entry_shadows);
+                let mut body_shadows = entry_shadows.clone();
+                body_shadows.insert(fgen.val_var.clone());
+                if let Some(key_var) = &fgen.key_var {
+                    body_shadows.insert(key_var.clone());
+                }
+                collect_sibling_field_refs_entries_in(&fgen.body, refs, &body_shadows);
             }
             Entry::WhenGenerator(wgen) => {
-                collect_sibling_field_refs_expr(&wgen.condition, refs, false);
-                collect_sibling_field_refs_entries(&wgen.body, refs);
+                collect_sibling_field_refs_expr_in(&wgen.condition, refs, false, &entry_shadows);
+                collect_sibling_field_refs_entries_in(&wgen.body, refs, &entry_shadows);
                 if let Some(else_body) = &wgen.else_body {
-                    collect_sibling_field_refs_entries(else_body, refs);
+                    collect_sibling_field_refs_entries_in(else_body, refs, &entry_shadows);
                 }
             }
             Entry::Spread(expr) | Entry::Elem(expr) => {
-                collect_sibling_field_refs_expr(expr, refs, false);
+                collect_sibling_field_refs_expr_in(expr, refs, false, &entry_shadows);
             }
-            Entry::ClassDef(_, _, _, body) => collect_sibling_field_refs_entries(body, refs),
-            Entry::TypeAlias(_, ty) => collect_sibling_field_refs_type(ty, refs),
+            Entry::ClassDef(_, _, _, body) => {
+                collect_sibling_field_refs_entries_in(body, refs, &entry_shadows)
+            }
+            Entry::TypeAlias(_, ty) => collect_sibling_field_refs_type_in(ty, refs, &entry_shadows),
         }
     }
 }
@@ -955,14 +972,24 @@ fn constraint_bound_names_resolving(
 /// `module.field` reads in a type's constraints, which run when a value is
 /// checked against it.
 fn collect_sibling_field_refs_type(ty: &crate::parser::TypeExpr, refs: &mut HashSet<String>) {
+    collect_sibling_field_refs_type_in(ty, refs, &HashSet::default());
+}
+
+fn collect_sibling_field_refs_type_in(
+    ty: &crate::parser::TypeExpr,
+    refs: &mut HashSet<String>,
+    shadows: &HashSet<String>,
+) {
     match ty {
         crate::parser::TypeExpr::Constrained(_, constraint) => {
-            collect_sibling_field_refs_expr(constraint, refs, false);
+            collect_sibling_field_refs_expr_in(constraint, refs, false, shadows);
         }
-        crate::parser::TypeExpr::Nullable(inner) => collect_sibling_field_refs_type(inner, refs),
+        crate::parser::TypeExpr::Nullable(inner) => {
+            collect_sibling_field_refs_type_in(inner, refs, shadows)
+        }
         crate::parser::TypeExpr::Union(types) | crate::parser::TypeExpr::Generic(_, types) => {
             for ty in types {
-                collect_sibling_field_refs_type(ty, refs);
+                collect_sibling_field_refs_type_in(ty, refs, shadows);
             }
         }
         crate::parser::TypeExpr::Named(_) => {}
@@ -974,74 +1001,96 @@ pub(super) fn collect_sibling_field_refs_expr(
     refs: &mut HashSet<String>,
     include_this: bool,
 ) {
+    collect_sibling_field_refs_expr_in(expr, refs, include_this, &HashSet::default());
+}
+
+// A quoted `module` (or `this`) may name a lexical value instead of the
+// receiver. Carry those bindings through nested bodies and type constraints.
+fn collect_sibling_field_refs_expr_in(
+    expr: &Expr,
+    refs: &mut HashSet<String>,
+    include_this: bool,
+    shadows: &HashSet<String>,
+) {
     match expr {
         Expr::Field(base, field) | Expr::NullSafeField(base, field) => {
-            if is_module_sibling_ref(base, include_this) {
+            if is_module_sibling_ref(base, include_this)
+                && matches!(base.as_ref(), Expr::Ident(name) if !shadows.contains(name))
+            {
                 refs.insert(field.clone());
             }
-            collect_sibling_field_refs_expr(base, refs, include_this);
+            collect_sibling_field_refs_expr_in(base, refs, include_this, shadows);
         }
         Expr::Index(base, index) => {
-            if is_module_sibling_ref(base, include_this) {
+            if is_module_sibling_ref(base, include_this)
+                && matches!(base.as_ref(), Expr::Ident(name) if !shadows.contains(name))
+            {
                 if let Expr::String(key) = index.as_ref() {
                     refs.insert(key.to_string());
                 } else {
                     refs.insert(DYNAMIC_SIBLING_REF.to_string());
                 }
             }
-            collect_sibling_field_refs_expr(base, refs, include_this);
-            collect_sibling_field_refs_expr(index, refs, include_this);
+            collect_sibling_field_refs_expr_in(base, refs, include_this, shadows);
+            collect_sibling_field_refs_expr_in(index, refs, include_this, shadows);
         }
         Expr::Binop(_, left, right) => {
-            collect_sibling_field_refs_expr(left, refs, include_this);
-            collect_sibling_field_refs_expr(right, refs, include_this);
+            collect_sibling_field_refs_expr_in(left, refs, include_this, shadows);
+            collect_sibling_field_refs_expr_in(right, refs, include_this, shadows);
         }
         Expr::New(type_name, entries, _) => {
             // `new module.C {}` reads the module member `C`.
             if let Some((root, rest)) = type_name.as_deref().and_then(|name| name.split_once('.'))
                 && (root == "module" || (include_this && root == "this"))
+                && !shadows.contains(root)
             {
                 let member = rest.split('.').next().unwrap_or(rest);
                 refs.insert(member.to_string());
             }
-            collect_sibling_field_refs_entries(entries, refs);
+            collect_sibling_field_refs_entries_in(entries, refs, shadows);
         }
         Expr::InferredNew(_, entries) | Expr::ObjectBody(entries) => {
-            collect_sibling_field_refs_entries(entries, refs);
+            collect_sibling_field_refs_entries_in(entries, refs, shadows);
         }
         Expr::Call(callee, args) => {
-            collect_sibling_field_refs_expr(callee, refs, include_this);
+            collect_sibling_field_refs_expr_in(callee, refs, include_this, shadows);
             for arg in args {
-                collect_sibling_field_refs_expr(arg, refs, include_this);
+                collect_sibling_field_refs_expr_in(arg, refs, include_this, shadows);
             }
         }
         Expr::If(cond, then_expr, else_expr) => {
-            collect_sibling_field_refs_expr(cond, refs, include_this);
-            collect_sibling_field_refs_expr(then_expr, refs, include_this);
-            collect_sibling_field_refs_expr(else_expr, refs, include_this);
+            collect_sibling_field_refs_expr_in(cond, refs, include_this, shadows);
+            collect_sibling_field_refs_expr_in(then_expr, refs, include_this, shadows);
+            collect_sibling_field_refs_expr_in(else_expr, refs, include_this, shadows);
         }
-        Expr::Let(_, value, body) => {
-            collect_sibling_field_refs_expr(value, refs, include_this);
-            collect_sibling_field_refs_expr(body, refs, include_this);
+        Expr::Let(name, value, body) => {
+            collect_sibling_field_refs_expr_in(value, refs, include_this, shadows);
+            let mut body_shadows = shadows.clone();
+            body_shadows.insert(name.clone());
+            collect_sibling_field_refs_expr_in(body, refs, include_this, &body_shadows);
         }
         Expr::Is(value, ty) | Expr::As(value, ty) => {
-            collect_sibling_field_refs_expr(value, refs, include_this);
+            collect_sibling_field_refs_expr_in(value, refs, include_this, shadows);
             // `module.field` reads in the checked type's constraints.
-            collect_sibling_field_refs_type(ty, refs);
+            collect_sibling_field_refs_type_in(ty, refs, shadows);
         }
-        Expr::Lambda(_, body) => collect_sibling_field_refs_expr(body, refs, include_this),
+        Expr::Lambda(params, body) => {
+            let mut body_shadows = shadows.clone();
+            body_shadows.extend(params.iter().cloned());
+            collect_sibling_field_refs_expr_in(body, refs, include_this, &body_shadows);
+        }
         Expr::Unop(_, body)
         | Expr::Throw(body)
         | Expr::Trace(body, _)
         | Expr::Read(body, _)
         | Expr::ReadOrNull(body, _)
         | Expr::ReadGlob(body, _) => {
-            collect_sibling_field_refs_expr(body, refs, include_this);
+            collect_sibling_field_refs_expr_in(body, refs, include_this, shadows);
         }
         Expr::StringInterpolation(parts) => {
             for part in parts {
                 if let StringInterpPart::Expr(expr) = part {
-                    collect_sibling_field_refs_expr(expr, refs, include_this);
+                    collect_sibling_field_refs_expr_in(expr, refs, include_this, shadows);
                 }
             }
         }
