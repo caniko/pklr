@@ -404,9 +404,8 @@ pub(super) fn expand_requested_fields(
         classes: ModuleClasses::new(entries),
     };
     let aliases = Some(&module_aliases);
-    // An importer reading `dep.ClassName` needs the module properties the
-    // class reads through `module` (it is evaluated against them). Other
-    // definitions don't see module properties, so they need nothing more.
+    // An importer reading a class or alias needs the module properties reached
+    // by its definition, including the constraints of any aliases it uses.
     let module_reading_definitions = if requested
         .iter()
         .any(|name| definitions.types.contains_key(name.as_str()))
@@ -448,9 +447,8 @@ pub(super) fn expand_requested_fields(
                         collect_sibling_field_refs_entries(body, &mut refs.values);
                     }
                 }
-                // A requested class or type alias that reads `module` (an
-                // importer reading `dep.ClassName`) depends on what its
-                // definition reads.
+                // A requested class or alias also needs the module properties
+                // its transitive type constraints read, even without `module.`.
                 Entry::ClassDef(name, ..) | Entry::TypeAlias(name, _)
                     if expanded.contains(name) && module_reading_definitions.contains(name) =>
                 {
@@ -1924,8 +1922,8 @@ pub(super) fn module_evaluation_plan(entries: &[Entry]) -> EvaluationPlan {
 
 /// Names, in declaration order, of the module members in `entries` that must
 /// be evaluated again once the module's properties are available: classes
-/// whose bodies read `module` or a module property by name (`a = min`), and
-/// the members that reference such a member
+/// whose bodies read `module` or a module property by name (`a = min`), type
+/// aliases whose constraints read module properties, and their dependents
 /// (a subclass, a type alias naming it, a local, or a module function
 /// building an instance).
 pub(super) fn module_dependent_members(entries: &[Entry]) -> indexmap::IndexSet<String> {
@@ -1936,11 +1934,11 @@ pub(super) fn module_dependent_members(entries: &[Entry]) -> indexmap::IndexSet<
         (root == "module" || (include_this && root == "this"))
             .then(|| rest.split('.').next().unwrap_or(rest))
     }
-    // Only a class that reads the module's properties starts a dependency
-    // chain. Most modules have no classes, so check for one first.
+    // A class or type alias can read module properties. Most modules have
+    // neither, so check for one first.
     if !entries
         .iter()
-        .any(|entry| matches!(entry, Entry::ClassDef(..)))
+        .any(|entry| matches!(entry, Entry::ClassDef(..) | Entry::TypeAlias(..)))
     {
         return indexmap::IndexSet::new();
     }
@@ -1993,7 +1991,11 @@ pub(super) fn module_dependent_members(entries: &[Entry]) -> indexmap::IndexSet<
             _ => None,
         })
         .collect();
-    let mut dependent = HashSet::default();
+    let mut dependent: HashSet<String> = classes
+        .properties
+        .iter()
+        .map(|name| name.to_string())
+        .collect();
     loop {
         let before = dependent.len();
         for (name, is_class, refs) in &members {

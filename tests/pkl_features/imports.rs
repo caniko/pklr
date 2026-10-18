@@ -2186,6 +2186,53 @@ fn narrowed_import_follows_module_reads_in_class_defaults() {
 }
 
 #[test]
+fn imported_class_retains_its_type_alias_constraint_bindings() {
+    let temp = TestTempDir::new("pklr_test_imported_class_constraint_scope");
+    let dir = temp.path();
+    for vendors in ["vendors", "module.vendors"] {
+        for default in ["", " = \"amd\""] {
+            std::fs::write(
+                dir.join("types.pkl"),
+                format!(
+                    "const vendors = new Listing {{ \"amd\"; \"intel\" }}\ntypealias VendorName = String({vendors}.contains(this))\ntypealias Vendor = VendorName\nclass Host {{ vendor: Vendor{default} }}\n"
+                ),
+            )
+            .unwrap();
+            let main = dir.join("main.pkl");
+            for shadow in [
+                "",
+                "local vendors = new Listing { \"caller\" }\ntypealias Vendor = Int\ntypealias VendorName = Boolean\n",
+            ] {
+                for body in ["vendor = selected", ""] {
+                    if body.is_empty() && default.is_empty() {
+                        continue;
+                    }
+                    std::fs::write(
+                        &main,
+                        format!(
+                            "import \"types.pkl\" as T\n{shadow}local selected = \"amd\"\nhost = new T.Host {{ {body} }}\n"
+                        ),
+                    )
+                    .unwrap();
+                    let value = pklr::eval_to_json(&main).unwrap_or_else(|error| {
+                        panic!("{vendors}, {default:?}, {shadow:?}, {body:?}: {error}")
+                    });
+                    assert_eq!(value, serde_json::json!({"host": {"vendor": "amd"}}));
+                }
+            }
+
+            std::fs::write(
+                &main,
+                "import \"types.pkl\" as T\nlocal vendors = new Listing { \"caller\" }\ntypealias Vendor = String\nhost = new T.Host { vendor = \"caller\" }\n",
+            )
+            .unwrap();
+            let error = pklr::eval_to_json(&main).unwrap_err().to_string();
+            assert!(error.contains("expected Vendor"), "{error}");
+        }
+    }
+}
+
+#[test]
 fn narrowed_import_ignores_class_properties_named_like_module_properties() {
     let temp = TestTempDir::new("pklr_test_narrowed_import_class_property_shadow");
     let dir = temp.path();
