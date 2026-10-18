@@ -2464,6 +2464,7 @@ fn narrowed_import_does_not_invoke_composite_stored_closures() {
     for holder in [
         "new Dynamic { callback = get }",
         "List(get)",
+        "Listing(get)",
         "Map(\"callback\", get)",
     ] {
         std::fs::write(dir.join("dep.pkl"), format!("bad = import(\"missing.pkl\")\nresult = (new Mapping {{\nlocal get = () -> bad.value\nlocal holder = {holder}\nlocal bad = new Dynamic {{ value = true }}\n[\"ok\"] = true\n}})[\"ok\"]\n")).unwrap();
@@ -2476,6 +2477,27 @@ fn narrowed_import_does_not_invoke_composite_stored_closures() {
         std::fs::write(dir.join("dep.pkl"), format!("good = true\nresult = (new Mapping {{\nlocal get = () -> `module`.good\nlocal holder = new Dynamic {{ callback = get }}\nlocal copies = List(get)\nlocal `module` = new Dynamic {{ good = false }}\n[\"ok\"] = {call}\n}})[\"ok\"]\n")).unwrap();
         let value = pklr::eval_to_json(&dir.join("main.pkl"))
             .unwrap_or_else(|error| panic!("{call}: {error}"));
+        assert_eq!(value, serde_json::json!({"result": true}));
+    }
+}
+
+#[test]
+fn narrowed_import_keeps_eager_user_defined_pair_calls() {
+    let temp = TestTempDir::new("pklr_test_narrowed_import_eager_pair");
+    let dir = temp.path();
+    std::fs::write(
+        dir.join("main.pkl"),
+        "import \"dep.pkl\" as Dep\nresult = Dep.result\n",
+    )
+    .unwrap();
+    for callee in ["Pair", "invoke"] {
+        std::fs::write(
+            dir.join("dep.pkl"),
+            format!("good = true\nresult = (new Mapping {{\nlocal get = () -> `module`.good\nlocal {callee} = (callback) -> callback()\nlocal holder = {callee}(get)\nlocal `module` = new Dynamic {{ good = false }}\n[\"ok\"] = true\n}})[\"ok\"]\n"),
+        )
+        .unwrap();
+        let value = pklr::eval_to_json(&dir.join("main.pkl"))
+            .unwrap_or_else(|error| panic!("{callee}: {error}"));
         assert_eq!(value, serde_json::json!({"result": true}));
     }
 }

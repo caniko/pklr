@@ -2135,7 +2135,7 @@ fn stored_methods(
             }
             Expr::Call(callee, args)
                 if composites
-                    && matches!(callee.as_ref(), Expr::Ident(name) if matches!(name.as_str(), "List" | "Map" | "Set" | "Pair")) =>
+                    && matches!(callee.as_ref(), Expr::Ident(name) if matches!(name.as_str(), "List" | "Listing" | "Map" | "Set")) =>
             {
                 args.iter().all(|arg| stored_names(arg, names, true))
             }
