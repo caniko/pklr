@@ -434,7 +434,13 @@ pub(super) fn expand_requested_fields(
                             aliases,
                             Some(&definitions),
                         );
-                        collect_sibling_field_refs_expr(expr, &mut refs.values, true);
+                        collect_sibling_field_refs_expr_in(
+                            expr,
+                            &mut refs.values,
+                            true,
+                            &HashSet::default(),
+                            aliases,
+                        );
                     }
                     if let Some(body) = &prop.body {
                         collect_entry_refs_in(
@@ -444,7 +450,12 @@ pub(super) fn expand_requested_fields(
                             aliases,
                             Some(&definitions),
                         );
-                        collect_sibling_field_refs_entries(body, &mut refs.values);
+                        collect_sibling_field_refs_entries_in(
+                            body,
+                            &mut refs.values,
+                            &HashSet::default(),
+                            aliases,
+                        );
                     }
                 }
                 // A requested class or alias also needs the module properties
@@ -548,9 +559,11 @@ fn follow_definitions(definitions: &Definitions, refs: &mut Names, aliases: Opti
                     .values
                     .retain(|root| !definitions.classes.is_property(root) || reads.contains(root));
             }
-            collect_sibling_field_refs_entries(
+            collect_sibling_field_refs_entries_in(
                 std::slice::from_ref(*definition),
                 &mut definition_refs.values,
+                &HashSet::default(),
+                aliases,
             );
         }
         let mut local_refs = Names::default();
@@ -566,13 +579,29 @@ fn follow_definitions(definitions: &Definitions, refs: &mut Names, aliases: Opti
         // At module level `this` is the module object too.
         if let Some(Entry::Property(prop)) = local {
             if let Some(ty) = &prop.type_ann {
-                collect_sibling_field_refs_type(ty, &mut local_refs.values);
+                collect_sibling_field_refs_type_in(
+                    ty,
+                    &mut local_refs.values,
+                    &HashSet::default(),
+                    Some(definitions.module_aliases),
+                );
             }
             if let Some(expr) = &prop.value {
-                collect_sibling_field_refs_expr(expr, &mut local_refs.values, true);
+                collect_sibling_field_refs_expr_in(
+                    expr,
+                    &mut local_refs.values,
+                    true,
+                    &HashSet::default(),
+                    Some(definitions.module_aliases),
+                );
             }
             if let Some(body) = &prop.body {
-                collect_sibling_field_refs_entries(body, &mut local_refs.values);
+                collect_sibling_field_refs_entries_in(
+                    body,
+                    &mut local_refs.values,
+                    &HashSet::default(),
+                    Some(definitions.module_aliases),
+                );
             }
         }
         for (deps, module_scope) in [(definition_refs, module_scope), (local_refs, true)] {
@@ -598,7 +627,7 @@ fn follow_definitions(definitions: &Definitions, refs: &mut Names, aliases: Opti
 }
 
 pub(super) fn collect_sibling_field_refs_entries(entries: &[Entry], refs: &mut HashSet<String>) {
-    collect_sibling_field_refs_entries_in(entries, refs, &HashSet::default());
+    collect_sibling_field_refs_entries_in(entries, refs, &HashSet::default(), None);
 }
 
 // Match eval_listing_entries: dependencies precede their readers, while cycles
@@ -656,18 +685,65 @@ impl BodyEvaluation {
         }
     }
 
-    fn inferred(ty: &crate::parser::TypeExpr, entries: &[Entry]) -> Self {
+    fn inferred(
+        ty: &crate::parser::TypeExpr,
+        entries: &[Entry],
+        aliases: Option<&TypeAliases>,
+    ) -> Self {
+        Self::inferred_at(ty, entries, aliases, 0)
+    }
+
+    fn inferred_at(
+        ty: &crate::parser::TypeExpr,
+        entries: &[Entry],
+        aliases: Option<&TypeAliases>,
+        depth: usize,
+    ) -> Self {
         use crate::parser::TypeExpr;
+        // Match inferred_new_type's recursive-alias ceiling.
+        if depth > 32 {
+            return Self::Object;
+        }
         match ty {
-            TypeExpr::Nullable(inner) => Self::inferred(inner, entries),
+            TypeExpr::Nullable(inner) => Self::inferred_at(inner, entries, aliases, depth + 1),
             TypeExpr::Union(types) => types
                 .iter()
                 .find(|ty| is_default_type(ty))
-                .map_or(Self::Object, |ty| Self::inferred(ty, entries)),
+                .map_or(Self::Object, |ty| {
+                    Self::inferred_at(ty, entries, aliases, depth + 1)
+                }),
             TypeExpr::Named(name) | TypeExpr::Generic(name, _) | TypeExpr::Constrained(name, _) => {
                 let name = name.trim_start_matches('*').trim_end_matches('?');
+                if let Some(Some(ty)) = aliases.and_then(|aliases| aliases.get(name)) {
+                    return Self::inferred_at(ty, entries, aliases, depth + 1);
+                }
                 Self::new(Some(name.split('<').next().unwrap_or(name)), entries)
             }
+        }
+    }
+
+    fn amendment(base: &Expr, entries: &[Entry], aliases: Option<&TypeAliases>) -> Self {
+        match base {
+            Expr::New(name, body, params) => {
+                let kind = Self::new(name.as_deref(), body);
+                if kind == Self::Mapping
+                    && params.len() < 2
+                    && !body.iter().any(
+                        |entry| matches!(entry, Entry::Property(prop) if prop.name == "default"),
+                    )
+                {
+                    // Untyped Mappings use eval_amended_object rather than
+                    // the specialized typed/default Mapping entry evaluator.
+                    Self::Object
+                } else {
+                    kind
+                }
+            }
+            Expr::InferredNew(ty, body) => Self::inferred(ty, body, aliases),
+            Expr::Binop(BinOp::Add, base, _) | Expr::Trace(base, _) => {
+                Self::amendment(base, entries, aliases)
+            }
+            _ => Self::new(None, entries),
         }
     }
 }
@@ -681,7 +757,7 @@ fn early_local_lambda_refs(entries: &[Entry], evaluation: BodyEvaluation) -> Has
     {
         return refs;
     }
-    let stored = stored_methods(entries, EagerReads::is_method);
+    let stored = stored_methods(entries, EagerReads::is_method, true);
     let mut late_refs = HashSet::default();
     for entry in entries {
         match entry {
@@ -726,13 +802,13 @@ fn early_local_lambda_refs(entries: &[Entry], evaluation: BodyEvaluation) -> Has
         stored
             .iter()
             .filter(|(name, _)| late_refs.contains(**name))
-            .map(|(_, method)| method.to_string()),
+            .flat_map(|(_, methods)| methods.iter().map(|method| method.to_string())),
     );
     loop {
         let before = refs.len();
-        for (name, method) in &stored {
+        for (name, methods) in &stored {
             if refs.contains(*name) {
-                refs.insert(method.to_string());
+                refs.extend(methods.iter().map(|method| method.to_string()));
             }
         }
         for entry in entries {
@@ -754,12 +830,14 @@ fn collect_sibling_field_refs_entries_in(
     entries: &[Entry],
     refs: &mut HashSet<String>,
     shadows: &HashSet<String>,
+    aliases: Option<&TypeAliases>,
 ) {
     collect_sibling_field_refs_entries_ordered(
         entries,
         refs,
         shadows,
         BodyEvaluation::new(None, entries),
+        aliases,
     );
 }
 
@@ -768,9 +846,12 @@ fn collect_sibling_field_refs_entries_ordered(
     refs: &mut HashSet<String>,
     shadows: &HashSet<String>,
     evaluation: BodyEvaluation,
+    aliases: Option<&TypeAliases>,
 ) {
     let listing = evaluation == BodyEvaluation::Listing;
     let mut entry_shadows = shadows.clone();
+    let no_aliases = TypeAliases::default();
+    let mut entry_aliases = std::borrow::Cow::Borrowed(aliases.unwrap_or(&no_aliases));
     let early_lambdas = if listing {
         HashSet::default()
     } else {
@@ -783,33 +864,34 @@ fn collect_sibling_field_refs_entries_ordered(
         .map(|&index| &entries[index])
         .chain(entries.iter().filter(|_| !listing))
     {
+        let aliases = Some(entry_aliases.as_ref());
         match entry {
             Entry::Property(prop) if listing || has_modifier(&prop.modifiers, Modifier::Local) => {
-                if listing
-                    && let Some(expr) = &prop.value
+                if let Some(expr) = &prop.value
                     && expr_mentions(expr, "super")
                 {
                     // Endpoint reads re-enter the member walk in this partial
                     // scope, not the completed dependency-ordered scope.
                     collect_sibling_field_refs_entries_ordered(
-                        &reentrant_listing_reads(entries, expr),
+                        &reentrant_body_reads(entries, expr, evaluation),
                         refs,
                         &entry_shadows,
                         BodyEvaluation::Object,
+                        aliases,
                     );
                 }
                 if let Some(ty) = &prop.type_ann {
-                    collect_sibling_field_refs_type_in(ty, refs, &entry_shadows);
+                    collect_sibling_field_refs_type_in(ty, refs, &entry_shadows, aliases);
                 }
                 if let Some(expr) = &prop.value
                     && (listing
                         || !matches!(expr, Expr::Lambda(..))
                         || early_lambdas.contains(&prop.name))
                 {
-                    collect_sibling_field_refs_expr_in(expr, refs, false, &entry_shadows);
+                    collect_sibling_field_refs_expr_in(expr, refs, false, &entry_shadows, aliases);
                 }
                 if let Some(body) = &prop.body {
-                    collect_sibling_field_refs_entries_in(body, refs, &entry_shadows);
+                    collect_sibling_field_refs_entries_in(body, refs, &entry_shadows, aliases);
                 }
                 if prop.body.is_some()
                     || prop
@@ -823,8 +905,12 @@ fn collect_sibling_field_refs_entries_ordered(
                 }
             }
             Entry::ClassDef(name, _, _, body) => {
-                collect_sibling_field_refs_entries_in(body, refs, &entry_shadows);
+                collect_sibling_field_refs_entries_in(body, refs, &entry_shadows, aliases);
                 entry_shadows.insert(name.clone());
+                entry_aliases.to_mut().insert(name.as_str(), None);
+            }
+            Entry::TypeAlias(name, ty) => {
+                entry_aliases.to_mut().insert(name.as_str(), Some(ty));
             }
             Entry::Property(prop) => {
                 // An overridable property may be amended to the real module.
@@ -833,6 +919,7 @@ fn collect_sibling_field_refs_entries_ordered(
             _ => {}
         }
     }
+    let aliases = Some(entry_aliases.as_ref());
     for entry in entries {
         match entry {
             Entry::Property(prop)
@@ -841,21 +928,27 @@ fn collect_sibling_field_refs_entries_ordered(
                         && !matches!(prop.value, Some(Expr::Lambda(..)))) => {}
             Entry::Property(prop) => {
                 if let Some(ty) = &prop.type_ann {
-                    collect_sibling_field_refs_type_in(ty, refs, &entry_shadows);
+                    collect_sibling_field_refs_type_in(ty, refs, &entry_shadows, aliases);
                 }
                 if let Some(expr) = &prop.value {
-                    collect_sibling_field_refs_expr_in(expr, refs, false, &entry_shadows);
+                    collect_sibling_field_refs_expr_in(expr, refs, false, &entry_shadows, aliases);
                 }
                 if let Some(body) = &prop.body {
-                    collect_sibling_field_refs_entries_in(body, refs, &entry_shadows);
+                    collect_sibling_field_refs_entries_in(body, refs, &entry_shadows, aliases);
                 }
             }
             Entry::DynProperty(key, value) | Entry::Predicate(key, value) => {
-                collect_sibling_field_refs_expr_in(key, refs, false, &entry_shadows);
-                collect_sibling_field_refs_expr_in(value, refs, false, &entry_shadows);
+                collect_sibling_field_refs_expr_in(key, refs, false, &entry_shadows, aliases);
+                collect_sibling_field_refs_expr_in(value, refs, false, &entry_shadows, aliases);
             }
             Entry::ForGenerator(fgen) => {
-                collect_sibling_field_refs_expr_in(&fgen.collection, refs, false, &entry_shadows);
+                collect_sibling_field_refs_expr_in(
+                    &fgen.collection,
+                    refs,
+                    false,
+                    &entry_shadows,
+                    aliases,
+                );
                 let mut body_shadows = entry_shadows.clone();
                 // eval_call handles these collection constructors directly.
                 // Unknown items may still alias the module, so retain their
@@ -891,15 +984,23 @@ fn collect_sibling_field_refs_entries_ordered(
                     refs,
                     &body_shadows,
                     evaluation,
+                    aliases,
                 );
             }
             Entry::WhenGenerator(wgen) => {
-                collect_sibling_field_refs_expr_in(&wgen.condition, refs, false, &entry_shadows);
+                collect_sibling_field_refs_expr_in(
+                    &wgen.condition,
+                    refs,
+                    false,
+                    &entry_shadows,
+                    aliases,
+                );
                 collect_sibling_field_refs_entries_ordered(
                     &wgen.body,
                     refs,
                     &entry_shadows,
                     evaluation,
+                    aliases,
                 );
                 if let Some(else_body) = &wgen.else_body {
                     collect_sibling_field_refs_entries_ordered(
@@ -907,14 +1008,17 @@ fn collect_sibling_field_refs_entries_ordered(
                         refs,
                         &entry_shadows,
                         evaluation,
+                        aliases,
                     );
                 }
             }
             Entry::Spread(expr) | Entry::Elem(expr) => {
-                collect_sibling_field_refs_expr_in(expr, refs, false, &entry_shadows);
+                collect_sibling_field_refs_expr_in(expr, refs, false, &entry_shadows, aliases);
             }
             Entry::ClassDef(..) => {}
-            Entry::TypeAlias(_, ty) => collect_sibling_field_refs_type_in(ty, refs, &entry_shadows),
+            Entry::TypeAlias(_, ty) => {
+                collect_sibling_field_refs_type_in(ty, refs, &entry_shadows, aliases)
+            }
         }
     }
 }
@@ -1239,24 +1343,25 @@ fn constraint_bound_names_resolving(
 /// `module.field` reads in a type's constraints, which run when a value is
 /// checked against it.
 fn collect_sibling_field_refs_type(ty: &crate::parser::TypeExpr, refs: &mut HashSet<String>) {
-    collect_sibling_field_refs_type_in(ty, refs, &HashSet::default());
+    collect_sibling_field_refs_type_in(ty, refs, &HashSet::default(), None);
 }
 
 fn collect_sibling_field_refs_type_in(
     ty: &crate::parser::TypeExpr,
     refs: &mut HashSet<String>,
     shadows: &HashSet<String>,
+    aliases: Option<&TypeAliases>,
 ) {
     match ty {
         crate::parser::TypeExpr::Constrained(_, constraint) => {
-            collect_sibling_field_refs_expr_in(constraint, refs, false, shadows);
+            collect_sibling_field_refs_expr_in(constraint, refs, false, shadows, aliases);
         }
         crate::parser::TypeExpr::Nullable(inner) => {
-            collect_sibling_field_refs_type_in(inner, refs, shadows)
+            collect_sibling_field_refs_type_in(inner, refs, shadows, aliases)
         }
         crate::parser::TypeExpr::Union(types) | crate::parser::TypeExpr::Generic(_, types) => {
             for ty in types {
-                collect_sibling_field_refs_type_in(ty, refs, shadows);
+                collect_sibling_field_refs_type_in(ty, refs, shadows, aliases);
             }
         }
         crate::parser::TypeExpr::Named(_) => {}
@@ -1268,7 +1373,7 @@ pub(super) fn collect_sibling_field_refs_expr(
     refs: &mut HashSet<String>,
     include_this: bool,
 ) {
-    collect_sibling_field_refs_expr_in(expr, refs, include_this, &HashSet::default());
+    collect_sibling_field_refs_expr_in(expr, refs, include_this, &HashSet::default(), None);
 }
 
 // A quoted `module` (or `this`) may name a non-module lexical value instead
@@ -1297,6 +1402,7 @@ fn collect_sibling_field_refs_expr_in(
     refs: &mut HashSet<String>,
     include_this: bool,
     shadows: &HashSet<String>,
+    aliases: Option<&TypeAliases>,
 ) {
     match expr {
         Expr::Field(base, field) | Expr::NullSafeField(base, field) => {
@@ -1305,7 +1411,7 @@ fn collect_sibling_field_refs_expr_in(
             {
                 refs.insert(field.clone());
             }
-            collect_sibling_field_refs_expr_in(base, refs, include_this, shadows);
+            collect_sibling_field_refs_expr_in(base, refs, include_this, shadows, aliases);
         }
         Expr::Index(base, index) => {
             if is_module_sibling_ref(base, include_this)
@@ -1317,12 +1423,24 @@ fn collect_sibling_field_refs_expr_in(
                     refs.insert(DYNAMIC_SIBLING_REF.to_string());
                 }
             }
-            collect_sibling_field_refs_expr_in(base, refs, include_this, shadows);
-            collect_sibling_field_refs_expr_in(index, refs, include_this, shadows);
+            collect_sibling_field_refs_expr_in(base, refs, include_this, shadows, aliases);
+            collect_sibling_field_refs_expr_in(index, refs, include_this, shadows, aliases);
         }
-        Expr::Binop(_, left, right) => {
-            collect_sibling_field_refs_expr_in(left, refs, include_this, shadows);
-            collect_sibling_field_refs_expr_in(right, refs, include_this, shadows);
+        Expr::Binop(op, left, right) => {
+            collect_sibling_field_refs_expr_in(left, refs, include_this, shadows, aliases);
+            if *op == BinOp::Add
+                && let Expr::ObjectBody(entries) = right.as_ref()
+            {
+                collect_sibling_field_refs_entries_ordered(
+                    entries,
+                    refs,
+                    shadows,
+                    BodyEvaluation::amendment(left, entries, aliases),
+                    aliases,
+                );
+            } else {
+                collect_sibling_field_refs_expr_in(right, refs, include_this, shadows, aliases);
+            }
         }
         Expr::New(type_name, entries, _) => {
             // `new module.C {}` reads the module member `C`.
@@ -1338,6 +1456,7 @@ fn collect_sibling_field_refs_expr_in(
                 refs,
                 shadows,
                 BodyEvaluation::new(type_name.as_deref(), entries),
+                aliases,
             );
         }
         Expr::InferredNew(ty, entries) => {
@@ -1345,15 +1464,16 @@ fn collect_sibling_field_refs_expr_in(
                 entries,
                 refs,
                 shadows,
-                BodyEvaluation::inferred(ty, entries),
+                BodyEvaluation::inferred(ty, entries, aliases),
+                aliases,
             );
         }
         Expr::ObjectBody(entries) => {
-            collect_sibling_field_refs_entries_in(entries, refs, shadows);
+            collect_sibling_field_refs_entries_in(entries, refs, shadows, aliases);
         }
         Expr::Call(callee, args) => {
             for arg in args {
-                collect_sibling_field_refs_expr_in(arg, refs, include_this, shadows);
+                collect_sibling_field_refs_expr_in(arg, refs, include_this, shadows, aliases);
             }
             if let Expr::Lambda(params, body) = callee.as_ref() {
                 let mut body_shadows = shadows.clone();
@@ -1365,37 +1485,43 @@ fn collect_sibling_field_refs_expr_in(
                         body_shadows.insert(param.clone());
                     }
                 }
-                collect_sibling_field_refs_expr_in(body, refs, include_this, &body_shadows);
+                collect_sibling_field_refs_expr_in(
+                    body,
+                    refs,
+                    include_this,
+                    &body_shadows,
+                    aliases,
+                );
             } else {
-                collect_sibling_field_refs_expr_in(callee, refs, include_this, shadows);
+                collect_sibling_field_refs_expr_in(callee, refs, include_this, shadows, aliases);
             }
         }
         Expr::If(cond, then_expr, else_expr) => {
-            collect_sibling_field_refs_expr_in(cond, refs, include_this, shadows);
-            collect_sibling_field_refs_expr_in(then_expr, refs, include_this, shadows);
-            collect_sibling_field_refs_expr_in(else_expr, refs, include_this, shadows);
+            collect_sibling_field_refs_expr_in(cond, refs, include_this, shadows, aliases);
+            collect_sibling_field_refs_expr_in(then_expr, refs, include_this, shadows, aliases);
+            collect_sibling_field_refs_expr_in(else_expr, refs, include_this, shadows, aliases);
         }
         Expr::Let(name, value, body) => {
-            collect_sibling_field_refs_expr_in(value, refs, include_this, shadows);
+            collect_sibling_field_refs_expr_in(value, refs, include_this, shadows, aliases);
             let mut body_shadows = shadows.clone();
             if is_non_module_value(value, shadows) {
                 body_shadows.insert(name.clone());
             } else {
                 body_shadows.remove(name);
             }
-            collect_sibling_field_refs_expr_in(body, refs, include_this, &body_shadows);
+            collect_sibling_field_refs_expr_in(body, refs, include_this, &body_shadows, aliases);
         }
         Expr::Is(value, ty) | Expr::As(value, ty) => {
-            collect_sibling_field_refs_expr_in(value, refs, include_this, shadows);
+            collect_sibling_field_refs_expr_in(value, refs, include_this, shadows, aliases);
             // `module.field` reads in the checked type's constraints.
-            collect_sibling_field_refs_type_in(ty, refs, shadows);
+            collect_sibling_field_refs_type_in(ty, refs, shadows, aliases);
         }
         Expr::Lambda(params, body) => {
             let mut body_shadows = shadows.clone();
             for param in params.iter() {
                 body_shadows.remove(param);
             }
-            collect_sibling_field_refs_expr_in(body, refs, include_this, &body_shadows);
+            collect_sibling_field_refs_expr_in(body, refs, include_this, &body_shadows, aliases);
         }
         Expr::Unop(_, body)
         | Expr::Throw(body)
@@ -1403,12 +1529,12 @@ fn collect_sibling_field_refs_expr_in(
         | Expr::Read(body, _)
         | Expr::ReadOrNull(body, _)
         | Expr::ReadGlob(body, _) => {
-            collect_sibling_field_refs_expr_in(body, refs, include_this, shadows);
+            collect_sibling_field_refs_expr_in(body, refs, include_this, shadows, aliases);
         }
         Expr::StringInterpolation(parts) => {
             for part in parts {
                 if let StringInterpPart::Expr(expr) = part {
-                    collect_sibling_field_refs_expr_in(expr, refs, include_this, shadows);
+                    collect_sibling_field_refs_expr_in(expr, refs, include_this, shadows, aliases);
                 }
             }
         }
@@ -1669,7 +1795,7 @@ struct EagerReads<'e> {
     /// scope's and the body's own.
     classes: ClassMap<'e>,
     methods: HashSet<&'e str>,
-    stored: HashMap<&'e str, &'e str>,
+    stored: HashMap<&'e str, HashSet<&'e str>>,
     /// What all of the body's defaults read.
     all: HashSet<String>,
     /// The methods all of the body's defaults run.
@@ -1699,7 +1825,7 @@ impl<'e> EagerReads<'e> {
                     _ => None,
                 })
                 .collect(),
-            stored: stored_methods(body, Self::is_method),
+            stored: stored_methods(body, Self::is_method, false),
             all: HashSet::default(),
             runs: HashSet::default(),
         };
@@ -1793,7 +1919,7 @@ impl<'e> EagerReads<'e> {
                 let shadow = class.shadow(&scope);
                 // Its methods called here, and the ones they call. Reading a
                 // property that only stores a method (see `stored`) calls it.
-                let stored = stored_methods(class.body, Self::is_method);
+                let stored = stored_methods(class.body, Self::is_method, false);
                 let mut called = fields.clone();
                 loop {
                     let calls_all = called.contains(DYNAMIC_SIBLING_REF);
@@ -1805,7 +1931,8 @@ impl<'e> EagerReads<'e> {
                                 (calls_all
                                     || called.contains(&prop.name)
                                     || stored.iter().any(|(property, method)| {
-                                        *method == prop.name && called.contains(*property)
+                                        method.contains(prop.name.as_str())
+                                            && called.contains(*property)
                                     }))
                                     && followed_nested.insert(std::ptr::from_ref(*entry))
                             }
@@ -1860,7 +1987,7 @@ impl<'e> EagerReads<'e> {
                 self.stored
                     .iter()
                     .filter(|(property, _)| read(property))
-                    .map(|(_, method)| *method),
+                    .flat_map(|(_, methods)| methods.iter().copied()),
             );
             let next: Vec<&Entry> = body
                 .iter()
@@ -1980,18 +2107,59 @@ fn referenced_roots_of(entries: &[&Entry]) -> HashSet<String> {
 
 /// The properties and locals of `body` that only store a method (one accepted
 /// by `is_method`), including alias chains and identity lets.
-fn stored_methods(body: &[Entry], is_method: fn(&Entry) -> bool) -> HashMap<&str, &str> {
-    fn stored_name(expr: &Expr) -> Option<&str> {
+fn stored_methods(
+    body: &[Entry],
+    is_method: fn(&Entry) -> bool,
+    composites: bool,
+) -> HashMap<&str, HashSet<&str>> {
+    // A storage expression does not invoke the functions it mentions. Unknown
+    // calls remain eager, since they may invoke function-valued arguments.
+    fn stored_names<'e>(expr: &'e Expr, names: &mut HashSet<&'e str>, composites: bool) -> bool {
         match expr {
-            Expr::Ident(name) => Some(name),
+            Expr::Ident(name) => {
+                names.insert(name);
+                true
+            }
             Expr::Field(base, name) if matches!(&**base, Expr::Ident(this) if this == "this") => {
-                Some(name)
+                names.insert(name);
+                true
             }
             Expr::Let(name, value, result) if matches!(&**result, Expr::Ident(result) if result == name) => {
-                stored_name(value)
+                stored_names(value, names, composites)
             }
-            _ => None,
+            Expr::New(None, entries, _) | Expr::ObjectBody(entries) if composites => {
+                stored_entries(entries, names)
+            }
+            Expr::New(Some(name), entries, _) if composites && name == "Dynamic" => {
+                stored_entries(entries, names)
+            }
+            Expr::Call(callee, args)
+                if composites
+                    && matches!(callee.as_ref(), Expr::Ident(name) if matches!(name.as_str(), "List" | "Map" | "Set" | "Pair")) =>
+            {
+                args.iter().all(|arg| stored_names(arg, names, true))
+            }
+            Expr::Null | Expr::Bool(_) | Expr::Int(_) | Expr::Float(_) | Expr::String(_) => true,
+            _ => false,
         }
+    }
+    fn stored_entries<'e>(entries: &'e [Entry], names: &mut HashSet<&'e str>) -> bool {
+        entries.iter().all(|entry| match entry {
+            Entry::Property(prop) => {
+                prop.value
+                    .as_ref()
+                    .is_some_and(|expr| stored_names(expr, names, true))
+                    && prop
+                        .body
+                        .as_ref()
+                        .is_none_or(|body| stored_entries(body, names))
+            }
+            Entry::Elem(expr) => stored_names(expr, names, true),
+            Entry::DynProperty(key, value) => {
+                stored_names(key, names, true) && stored_names(value, names, true)
+            }
+            _ => false,
+        })
     }
     let methods: HashSet<&str> = body
         .iter()
@@ -2000,21 +2168,45 @@ fn stored_methods(body: &[Entry], is_method: fn(&Entry) -> bool) -> HashMap<&str
             _ => None,
         })
         .collect();
-    let mut stored = HashMap::default();
+    if methods.is_empty() {
+        return HashMap::default();
+    }
+    let mut stored: HashMap<&str, HashSet<&str>> = HashMap::default();
+    // ponytail: small local alias sets use fixed-point rescans; use a reverse
+    // dependency worklist if large bodies make this traversal hot.
     loop {
-        let before = stored.len();
+        let mut changed = false;
         for entry in body {
             if let Entry::Property(prop) = entry
-                && let Some(name) = prop.value.as_ref().and_then(stored_name)
-                && let Some(method) = methods
-                    .get(name)
-                    .copied()
-                    .or_else(|| stored.get(name).copied())
+                && let Some(expr) = &prop.value
             {
-                stored.insert(prop.name.as_str(), method);
+                let mut names = HashSet::default();
+                // EagerReads removes storage entries entirely, so it accepts
+                // only aliases. Composites may have other eager value reads;
+                // the capture-phase caller removes just their invocation seed.
+                if !stored_names(expr, &mut names, composites) {
+                    continue;
+                }
+                let targets: HashSet<&str> = names
+                    .into_iter()
+                    .flat_map(|name| {
+                        methods.get(name).copied().into_iter().chain(
+                            stored
+                                .get(name)
+                                .into_iter()
+                                .flat_map(|targets| targets.iter().copied()),
+                        )
+                    })
+                    .collect();
+                if !targets.is_empty() {
+                    let targets_so_far = stored.entry(prop.name.as_str()).or_default();
+                    let before = targets_so_far.len();
+                    targets_so_far.extend(targets);
+                    changed |= targets_so_far.len() != before;
+                }
             }
         }
-        if stored.len() == before {
+        if !changed {
             return stored;
         }
     }
@@ -2088,55 +2280,70 @@ fn may_be_object(expr: &Expr) -> bool {
 }
 
 fn collect_field_names_expr(expr: &Expr, out: &mut HashSet<String>) {
+    collect_field_names_expr_from(expr, out, None);
+}
+
+fn collect_field_names_expr_from(expr: &Expr, out: &mut HashSet<String>, receiver: Option<&str>) {
     match expr {
         Expr::Field(base, name) | Expr::NullSafeField(base, name) => {
-            out.insert(name.clone());
-            collect_field_names_expr(base, out);
+            if receiver.is_none_or(
+                |receiver| matches!(base.as_ref(), Expr::Ident(name) if name == receiver),
+            ) {
+                out.insert(name.clone());
+            }
+            collect_field_names_expr_from(base, out, receiver);
         }
         Expr::Index(base, index) => {
-            match index.as_ref() {
-                Expr::String(key) => {
-                    out.insert(key.to_string());
-                }
-                _ => {
-                    out.insert(DYNAMIC_SIBLING_REF.to_string());
+            if receiver.is_none_or(
+                |receiver| matches!(base.as_ref(), Expr::Ident(name) if name == receiver),
+            ) {
+                match index.as_ref() {
+                    Expr::String(key) => {
+                        out.insert(key.to_string());
+                    }
+                    _ => {
+                        out.insert(DYNAMIC_SIBLING_REF.to_string());
+                    }
                 }
             }
-            collect_field_names_expr(base, out);
-            collect_field_names_expr(index, out);
+            collect_field_names_expr_from(base, out, receiver);
+            collect_field_names_expr_from(index, out, receiver);
         }
         Expr::New(_, entries, _) | Expr::ObjectBody(entries) | Expr::InferredNew(_, entries) => {
-            collect_field_names_entries(entries, out)
+            // Nested bodies have their own implicit receiver.
+            if receiver.is_none() {
+                collect_field_names_entries(entries, out)
+            }
         }
         Expr::Binop(op, left, right) => {
             // `x |> f` passes `x` to `f` like `f(x)`.
-            if matches!(op, BinOp::Pipe) && may_be_object(left) {
+            if receiver.is_none() && matches!(op, BinOp::Pipe) && may_be_object(left) {
                 out.insert(DYNAMIC_SIBLING_REF.to_string());
             }
-            collect_field_names_expr(left, out);
-            collect_field_names_expr(right, out);
+            collect_field_names_expr_from(left, out, receiver);
+            collect_field_names_expr_from(right, out, receiver);
         }
         Expr::Call(callee, args) => {
             // An object passed to a call may have any of its members read
             // there.
-            if args.iter().any(may_be_object) {
+            if receiver.is_none() && args.iter().any(may_be_object) {
                 out.insert(DYNAMIC_SIBLING_REF.to_string());
             }
-            collect_field_names_expr(callee, out);
+            collect_field_names_expr_from(callee, out, receiver);
             for arg in args {
-                collect_field_names_expr(arg, out);
+                collect_field_names_expr_from(arg, out, receiver);
             }
         }
         Expr::If(cond, then_expr, else_expr) => {
-            collect_field_names_expr(cond, out);
-            collect_field_names_expr(then_expr, out);
-            collect_field_names_expr(else_expr, out);
+            collect_field_names_expr_from(cond, out, receiver);
+            collect_field_names_expr_from(then_expr, out, receiver);
+            collect_field_names_expr_from(else_expr, out, receiver);
         }
         Expr::Let(_, value, body) => {
-            collect_field_names_expr(value, out);
-            collect_field_names_expr(body, out);
+            collect_field_names_expr_from(value, out, receiver);
+            collect_field_names_expr_from(body, out, receiver);
         }
-        Expr::Lambda(_, value) => collect_field_names_expr(value, out),
+        Expr::Lambda(_, value) => collect_field_names_expr_from(value, out, receiver),
         Expr::Is(value, _)
         | Expr::As(value, _)
         | Expr::Unop(_, value)
@@ -2144,11 +2351,11 @@ fn collect_field_names_expr(expr: &Expr, out: &mut HashSet<String>) {
         | Expr::Trace(value, _)
         | Expr::Read(value, _)
         | Expr::ReadOrNull(value, _)
-        | Expr::ReadGlob(value, _) => collect_field_names_expr(value, out),
+        | Expr::ReadGlob(value, _) => collect_field_names_expr_from(value, out, receiver),
         Expr::StringInterpolation(parts) => {
             for part in parts {
                 if let StringInterpPart::Expr(expr) = part {
-                    collect_field_names_expr(expr, out);
+                    collect_field_names_expr_from(expr, out, receiver);
                 }
             }
         }
@@ -2617,8 +2824,17 @@ fn collect_entry_refs_unnarrowed_ordered(
 ) {
     let listing = evaluation == BodyEvaluation::Listing;
     let mut initializer_shadows = std::borrow::Cow::Borrowed(shadows);
+    let no_aliases = TypeAliases::default();
+    let mut entry_aliases = std::borrow::Cow::Borrowed(aliases.unwrap_or(&no_aliases));
     let mut entry_shadows = shadows.clone();
     entry_shadows.extend(declared_entry_names(entries));
+    let pending = if evaluation == BodyEvaluation::Object && entries.iter().any(|entry|
+        matches!(entry, Entry::Property(prop) if has_modifier(&prop.modifiers, Modifier::Local)
+            && (!matches!(prop.value, Some(Expr::Lambda(..))) || has_modifier(&prop.modifiers, Modifier::Const)))) {
+        body_property_names(entries)
+    } else {
+        HashSet::default()
+    };
     let early_lambdas = if listing {
         HashSet::default()
     } else {
@@ -2631,14 +2847,14 @@ fn collect_entry_refs_unnarrowed_ordered(
         .map(|&index| &entries[index])
         .chain(entries.iter().filter(|_| !listing))
     {
+        let aliases = Some(entry_aliases.as_ref());
         match entry {
             Entry::Property(prop) if listing || has_modifier(&prop.modifiers, Modifier::Local) => {
-                if listing
-                    && let Some(expr) = &prop.value
+                if let Some(expr) = &prop.value
                     && expr_mentions(expr, "super")
                 {
                     collect_entry_refs_ordered(
-                        &reentrant_listing_reads(entries, expr),
+                        &reentrant_body_reads(entries, expr, evaluation),
                         refs,
                         &initializer_shadows,
                         aliases,
@@ -2646,18 +2862,28 @@ fn collect_entry_refs_unnarrowed_ordered(
                         BodyEvaluation::Object,
                     );
                 }
+                // Ordinary object locals wait for pending output members;
+                // those names never fall back to enclosing module properties.
+                // Initial lambda captures are not poisoned by eval_entries.
+                let mut active = std::borrow::Cow::Borrowed(initializer_shadows.as_ref());
+                if !pending.is_empty()
+                    && (!matches!(prop.value, Some(Expr::Lambda(..)))
+                        || has_modifier(&prop.modifiers, Modifier::Const))
+                {
+                    active.to_mut().values.extend(pending.iter().cloned());
+                }
                 if let Some(ty) = &prop.type_ann {
-                    collect_type_refs(ty, refs, &initializer_shadows, aliases, definitions);
+                    collect_type_refs(ty, refs, &active, aliases, definitions);
                 }
                 if let Some(expr) = &prop.value
                     && (listing
                         || !matches!(expr, Expr::Lambda(..))
                         || early_lambdas.contains(&prop.name))
                 {
-                    collect_expr_refs_in(expr, refs, &initializer_shadows, aliases, definitions);
+                    collect_expr_refs_in(expr, refs, &active, aliases, definitions);
                 }
                 if let Some(body) = &prop.body {
-                    collect_entry_refs_in(body, refs, &initializer_shadows, aliases, definitions);
+                    collect_entry_refs_in(body, refs, &active, aliases, definitions);
                 }
                 initializer_shadows
                     .to_mut()
@@ -2668,13 +2894,16 @@ fn collect_entry_refs_unnarrowed_ordered(
                 let initializer_shadows = initializer_shadows.to_mut();
                 initializer_shadows.values.insert(name.clone());
                 initializer_shadows.types.insert(name.clone());
+                entry_aliases.to_mut().insert(name.as_str(), None);
             }
-            Entry::TypeAlias(name, _) => {
+            Entry::TypeAlias(name, ty) => {
                 initializer_shadows.to_mut().types.insert(name.clone());
+                entry_aliases.to_mut().insert(name.as_str(), Some(ty));
             }
             _ => {}
         }
     }
+    let aliases = Some(entry_aliases.as_ref());
     for entry in entries {
         match entry {
             Entry::Property(prop)
@@ -2749,23 +2978,68 @@ fn collect_entry_refs_unnarrowed_ordered(
     }
 }
 
-fn reentrant_listing_reads(entries: &[Entry], initializer: &Expr) -> Vec<Entry> {
+fn reentrant_body_reads(
+    entries: &[Entry],
+    initializer: &Expr,
+    evaluation: BodyEvaluation,
+) -> Vec<Entry> {
     let mut fields = HashSet::default();
-    collect_field_names_expr(initializer, &mut fields);
-    let first = fields.contains("first");
-    let last = fields.contains("last");
+    collect_field_names_expr_from(initializer, &mut fields, Some("super"));
+    let first = evaluation == BodyEvaluation::Listing && fields.contains("first");
+    let last = evaluation == BodyEvaluation::Listing && fields.contains("last");
+    let metadata = first
+        || last
+        || ["length", "keys", "isEmpty", "isNotEmpty"]
+            .iter()
+            .any(|name| fields.contains(*name));
+    let mut metadata = if metadata {
+        receiver_metadata_entries(entries)
+    } else {
+        Vec::new()
+    };
     if !first && !last {
-        return Vec::new();
+        return metadata;
     }
     let mut reads = listing_endpoint_entries(entries, &[]);
     if reads.iter().all(|entry| matches!(entry, Entry::Elem(_))) {
         let last = last.then(|| reads.pop()).flatten();
         let first = first.then(|| reads.into_iter().next()).flatten();
-        return first.into_iter().chain(last).collect();
+        metadata.extend(first.into_iter().chain(last));
+        return metadata;
     }
     // ponytail: generated/spread/indexed endpoint positions are unknown here;
     // retain all possible reads until static cardinality tracking is needed.
-    reads
+    metadata.extend(reads);
+    metadata
+}
+
+// eval_listing_length and eval_receiver_keys ignore locals and member values,
+// but evaluate keys, spreads and generator cardinalities in the calling scope.
+fn receiver_metadata_entries(entries: &[Entry]) -> Vec<Entry> {
+    entries
+        .iter()
+        .filter_map(|entry| {
+            Some(match entry {
+                Entry::DynProperty(key, _) => Entry::Elem(key.clone()),
+                Entry::Spread(_) => entry.clone(),
+                Entry::ForGenerator(generator) => {
+                    let mut generator = generator.clone();
+                    generator.body = receiver_metadata_entries(&generator.body).into();
+                    Entry::ForGenerator(generator)
+                }
+                Entry::WhenGenerator(generator) => {
+                    let mut generator = generator.clone();
+                    generator.body = receiver_metadata_entries(&generator.body).into();
+                    generator.else_body = generator
+                        .else_body
+                        .as_ref()
+                        .map(|body| receiver_metadata_entries(body).into());
+                    Entry::WhenGenerator(generator)
+                }
+                _ => return None,
+            })
+        })
+        .collect()
 }
 
 // Model eval_listing_member's declaration-order, demand-wrapped locals for a
@@ -2890,6 +3164,21 @@ fn collect_expr_refs_in(
         Expr::Field(base, _) | Expr::NullSafeField(base, _) => {
             collect_expr_refs_in(base, refs, shadows, aliases, definitions);
         }
+        Expr::Binop(BinOp::Add, base, overlay)
+            if matches!(overlay.as_ref(), Expr::ObjectBody(_)) =>
+        {
+            collect_expr_refs_in(base, refs, shadows, aliases, definitions);
+            if let Expr::ObjectBody(entries) = overlay.as_ref() {
+                collect_entry_refs_ordered(
+                    entries,
+                    refs,
+                    shadows,
+                    aliases,
+                    definitions,
+                    BodyEvaluation::amendment(base, entries, aliases),
+                );
+            }
+        }
         Expr::Index(base, index) | Expr::Binop(_, base, index) => {
             collect_expr_refs_in(base, refs, shadows, aliases, definitions);
             collect_expr_refs_in(index, refs, shadows, aliases, definitions);
@@ -2936,7 +3225,7 @@ fn collect_expr_refs_in(
                 shadows,
                 aliases,
                 definitions,
-                BodyEvaluation::inferred(ty, entries),
+                BodyEvaluation::inferred(ty, entries, aliases),
             );
         }
         Expr::ObjectBody(entries) => {
