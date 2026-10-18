@@ -2268,6 +2268,72 @@ fn narrowed_import_ignores_shadowed_module_receivers_in_constraints() {
 }
 
 #[test]
+fn narrowed_import_keeps_module_reads_in_local_initializers() {
+    let temp = TestTempDir::new("pklr_test_narrowed_import_local_module_initializer");
+    let dir = temp.path();
+    std::fs::write(
+        dir.join("dep.pkl"),
+        "good = true\nresult = (new Mapping {\nlocal `module` = new Dynamic { bad = module.good }\n[\"ok\"] = `module`.bad\n})[\"ok\"]\n",
+    )
+    .unwrap();
+    std::fs::write(
+        dir.join("main.pkl"),
+        "import \"dep.pkl\" as Dep\nresult = Dep.result\n",
+    )
+    .unwrap();
+    let value = pklr::eval_to_json(&dir.join("main.pkl")).unwrap();
+    assert_eq!(value, serde_json::json!({"result": true}));
+}
+
+#[test]
+fn narrowed_import_keeps_module_reads_in_rebound_local_lambdas() {
+    let temp = TestTempDir::new("pklr_test_narrowed_import_rebound_local_lambda");
+    let dir = temp.path();
+    std::fs::write(
+        dir.join("main.pkl"),
+        "import \"dep.pkl\" as Dep\nresult = Dep.result\n",
+    )
+    .unwrap();
+    std::fs::write(
+        dir.join("dep.pkl"),
+        "good = true\nresult = let (real = module) let (`module` = new Dynamic { good = false }) (new Mapping {\nlocal get = () -> `module`.good\nlocal early = get()\nlocal `module` = real\n[\"ok\"] = !early && get()\n})[\"ok\"]\n",
+    )
+    .unwrap();
+    let value = pklr::eval_to_json(&dir.join("main.pkl")).unwrap();
+    assert_eq!(value, serde_json::json!({"result": true}));
+}
+
+#[test]
+fn narrowed_import_keeps_module_receiver_alias_constraints() {
+    let temp = TestTempDir::new("pklr_test_narrowed_import_module_receiver_alias");
+    let dir = temp.path();
+    std::fs::write(
+        dir.join("main.pkl"),
+        "import \"dep.pkl\" as Dep\nresult = new Dep.C {}\n",
+    )
+    .unwrap();
+    // Preserve Pklr's existing module-object alias behavior. Official Pkl
+    // rejects a bare module object inside a type alias's const context.
+    for constraint in [
+        "let (`module` = module) `module`.good",
+        "((`module`) -> `module`.good)(module)",
+        "let (`module` = if (true) module else new Dynamic { good = false }) `module`.good",
+        "(new Mapping { local `module` = module; [\"ok\"] = `module`.good })[\"ok\"]",
+    ] {
+        std::fs::write(
+            dir.join("dep.pkl"),
+            format!(
+                "good = true\ntypealias Check = Boolean({constraint})\nclass C {{ ok: Check = true }}\n"
+            ),
+        )
+        .unwrap();
+        let value = pklr::eval_to_json(&dir.join("main.pkl"))
+            .unwrap_or_else(|error| panic!("{constraint}: {error}"));
+        assert_eq!(value, serde_json::json!({"result": {"ok": true}}));
+    }
+}
+
+#[test]
 fn narrowed_import_ignores_class_properties_named_like_module_properties() {
     let temp = TestTempDir::new("pklr_test_narrowed_import_class_property_shadow");
     let dir = temp.path();
