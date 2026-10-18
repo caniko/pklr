@@ -2584,6 +2584,48 @@ fn narrowed_import_ignores_fixed_non_module_class_receivers() {
 }
 
 #[test]
+fn narrowed_import_keeps_unresolved_amendment_dependencies() {
+    let temp = TestTempDir::new("pklr_test_narrowed_import_unknown_amendment");
+    let dir = temp.path();
+    std::fs::write(
+        dir.join("main.pkl"),
+        "import \"dep.pkl\" as Dep\nresult = Dep.result\n",
+    )
+    .unwrap();
+    for (declaration, base) in [
+        ("base = new Listing { false }", "base"),
+        ("initial = new Listing { false }\nbase = initial", "base"),
+        ("function makeBase() = new Listing { false }", "makeBase()"),
+    ] {
+        std::fs::write(dir.join("dep.pkl"), format!("good = true\n{declaration}\nresult = let (real = module) let (receiver = new Dynamic {{ good = false }}) (({base}) {{\nlocal `module` = receiver\nlocal receiver = real\n[0] = `module`.good\n}}).first\n")).unwrap();
+        let value = pklr::eval_to_json(&dir.join("main.pkl"))
+            .unwrap_or_else(|error| panic!("{base}: {error}"));
+        assert_eq!(value, serde_json::json!({"result": true}));
+    }
+}
+
+#[test]
+fn narrowed_import_evaluates_fixed_properties_after_locals() {
+    let temp = TestTempDir::new("pklr_test_narrowed_import_fixed_local_phases");
+    let dir = temp.path();
+    std::fs::write(
+        dir.join("main.pkl"),
+        "import \"dep.pkl\" as Dep\nresult = (new Dep.C {}).ok\n",
+    )
+    .unwrap();
+    for modifier in ["fixed", "const"] {
+        std::fs::write(dir.join("dep.pkl"), format!("const good = import(\"missing.pkl\")\nclass C {{\n{modifier} ok = `module`.good\nlocal const `module` = new Dynamic {{ good = true }}\n}}\n")).unwrap();
+        let value = pklr::eval_to_json(&dir.join("main.pkl"))
+            .unwrap_or_else(|error| panic!("{modifier}: {error}"));
+        assert_eq!(value, serde_json::json!({"result": true}));
+    }
+    // Instantiation keeps the fixed receiver when rebinding its local.
+    std::fs::write(dir.join("dep.pkl"), "good = true\nclass C {\nfixed `module` = new Dynamic { good = false }\nlocal get = () -> `module`.good\nok = get()\n}\n").unwrap();
+    let value = pklr::eval_to_json(&dir.join("main.pkl")).unwrap();
+    assert_eq!(value, serde_json::json!({"result": false}));
+}
+
+#[test]
 fn narrowed_import_keeps_pending_object_property_shadows() {
     let temp = TestTempDir::new("pklr_test_narrowed_import_pending_properties");
     let dir = temp.path();

@@ -673,6 +673,7 @@ enum BodyEvaluation {
     Object,
     Mapping,
     Listing,
+    Unknown,
 }
 
 impl BodyEvaluation {
@@ -724,11 +725,10 @@ impl BodyEvaluation {
 
     fn amendment(
         base: &Expr,
-        entries: &[Entry],
         aliases: Option<&TypeAliases>,
         bindings: &HashMap<String, Self>,
     ) -> Self {
-        Self::amendment_kind(base, aliases, bindings).unwrap_or_else(|| Self::new(None, entries))
+        Self::amendment_kind(base, aliases, bindings).unwrap_or(Self::Unknown)
     }
 
     fn amendment_kind(
@@ -871,6 +871,19 @@ fn collect_sibling_field_refs_entries_ordered(
     evaluation: BodyEvaluation,
     aliases: Option<&TypeAliases>,
 ) {
+    if evaluation == BodyEvaluation::Unknown {
+        // A keyed overlay can amend a Listing, Mapping or ordinary object.
+        // ponytail: nested unknown bases multiply walks; resolving their module
+        // definitions could narrow this union if it becomes a common cost.
+        for evaluation in [
+            BodyEvaluation::Object,
+            BodyEvaluation::Mapping,
+            BodyEvaluation::Listing,
+        ] {
+            collect_sibling_field_refs_entries_ordered(entries, refs, shadows, evaluation, aliases);
+        }
+        return;
+    }
     let listing = evaluation == BodyEvaluation::Listing;
     let mut entry_shadows = shadows.clone();
     let no_aliases = TypeAliases::default();
@@ -889,12 +902,7 @@ fn collect_sibling_field_refs_entries_ordered(
     {
         let aliases = Some(entry_aliases.as_ref());
         match entry {
-            Entry::Property(prop)
-                if listing
-                    || has_modifier(&prop.modifiers, Modifier::Local)
-                    || has_modifier(&prop.modifiers, Modifier::Fixed)
-                    || has_modifier(&prop.modifiers, Modifier::Const) =>
-            {
+            Entry::Property(prop) if listing || has_modifier(&prop.modifiers, Modifier::Local) => {
                 if let Some(expr) = &prop.value
                     && expr_mentions(expr, "super")
                 {
@@ -946,7 +954,8 @@ fn collect_sibling_field_refs_entries_ordered(
                 entry_aliases.to_mut().insert(name.as_str(), Some(ty));
             }
             Entry::Property(prop) => {
-                // An overridable property may be amended to the real module.
+                // Outputs bind after locals; overridable properties may also
+                // be amended to the real module rather than their default.
                 entry_shadows.values.remove(&prop.name);
                 entry_shadows.bind_amendment(&prop.name, None);
             }
@@ -956,12 +965,7 @@ fn collect_sibling_field_refs_entries_ordered(
     let aliases = Some(entry_aliases.as_ref());
     for entry in entries {
         match entry {
-            Entry::Property(prop)
-                if listing
-                    || ((has_modifier(&prop.modifiers, Modifier::Local)
-                        || has_modifier(&prop.modifiers, Modifier::Fixed)
-                        || has_modifier(&prop.modifiers, Modifier::Const))
-                        && !matches!(prop.value, Some(Expr::Lambda(..)))) => {}
+            Entry::Property(prop) if listing || has_modifier(&prop.modifiers, Modifier::Local) => {}
             Entry::Property(prop) => {
                 if let Some(ty) = &prop.type_ann {
                     collect_sibling_field_refs_type_in(ty, refs, &entry_shadows, aliases);
@@ -971,6 +975,28 @@ fn collect_sibling_field_refs_entries_ordered(
                 }
                 if let Some(body) = &prop.body {
                     collect_sibling_field_refs_entries_in(body, refs, &entry_shadows, aliases);
+                }
+                // These outputs cannot be overridden, but their initializers
+                // still run after all locals and before their own value binds.
+                if has_modifier(&prop.modifiers, Modifier::Fixed)
+                    || has_modifier(&prop.modifiers, Modifier::Const)
+                {
+                    if prop.body.is_some()
+                        || prop
+                            .value
+                            .as_ref()
+                            .is_some_and(|value| is_non_module_value(value, &entry_shadows.values))
+                    {
+                        entry_shadows.values.insert(prop.name.clone());
+                    }
+                    let kind = prop.value.as_ref().and_then(|value| {
+                        BodyEvaluation::amendment_kind(
+                            value,
+                            aliases,
+                            &entry_shadows.amendment_kinds,
+                        )
+                    });
+                    entry_shadows.bind_amendment(&prop.name, kind);
                 }
             }
             Entry::DynProperty(key, value) | Entry::Predicate(key, value) => {
@@ -1056,6 +1082,21 @@ fn collect_sibling_field_refs_entries_ordered(
             Entry::ClassDef(..) => {}
             Entry::TypeAlias(_, ty) => {
                 collect_sibling_field_refs_type_in(ty, refs, &entry_shadows, aliases)
+            }
+        }
+    }
+    // Final local-lambda reads see completed property bindings; their initial
+    // captures, when used, were collected in the first pass.
+    if !listing {
+        for entry in entries {
+            if let Entry::Property(prop) = entry
+                && has_modifier(&prop.modifiers, Modifier::Local)
+                && let Some(expr @ Expr::Lambda(..)) = &prop.value
+            {
+                if let Some(ty) = &prop.type_ann {
+                    collect_sibling_field_refs_type_in(ty, refs, &entry_shadows, aliases);
+                }
+                collect_sibling_field_refs_expr_in(expr, refs, false, &entry_shadows, aliases);
             }
         }
     }
@@ -1489,7 +1530,7 @@ fn collect_sibling_field_refs_expr_in(
                     entries,
                     refs,
                     shadows,
-                    BodyEvaluation::amendment(left, entries, aliases, &shadows.amendment_kinds),
+                    BodyEvaluation::amendment(left, aliases, &shadows.amendment_kinds),
                     aliases,
                 );
             } else {
@@ -2806,6 +2847,16 @@ fn collect_entry_refs_ordered(
     definitions: Option<&Definitions>,
     evaluation: BodyEvaluation,
 ) {
+    if evaluation == BodyEvaluation::Unknown {
+        for evaluation in [
+            BodyEvaluation::Object,
+            BodyEvaluation::Mapping,
+            BodyEvaluation::Listing,
+        ] {
+            collect_entry_refs_ordered(entries, refs, shadows, aliases, definitions, evaluation);
+        }
+        return;
+    }
     // A type alias or class declared in this body takes effect only from its
     // declaration on (a local evaluated earlier still sees the module's
     // aliases), and it can change what a module alias's definition refers to
@@ -3251,7 +3302,7 @@ fn collect_expr_refs_in(
                     shadows,
                     aliases,
                     definitions,
-                    BodyEvaluation::amendment(base, entries, aliases, &shadows.amendment_kinds),
+                    BodyEvaluation::amendment(base, aliases, &shadows.amendment_kinds),
                 );
             }
         }
