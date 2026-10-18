@@ -2463,6 +2463,8 @@ fn narrowed_import_does_not_invoke_composite_stored_closures() {
     .unwrap();
     for holder in [
         "new Dynamic { callback = get }",
+        "new Listing { get }",
+        "new Mapping { [\"callback\"] = get }",
         "List(get)",
         "Listing(get)",
         "Map(\"callback\", get)",
@@ -2473,8 +2475,13 @@ fn narrowed_import_does_not_invoke_composite_stored_closures() {
         assert_eq!(value, serde_json::json!({"result": true}));
     }
     // Storing still preserves the initial closure when the holder is used.
-    for call in ["holder.callback()", "copies[0]()"] {
-        std::fs::write(dir.join("dep.pkl"), format!("good = true\nresult = (new Mapping {{\nlocal get = () -> `module`.good\nlocal holder = new Dynamic {{ callback = get }}\nlocal copies = List(get)\nlocal `module` = new Dynamic {{ good = false }}\n[\"ok\"] = {call}\n}})[\"ok\"]\n")).unwrap();
+    for call in [
+        "holder.callback()",
+        "copies[0]()",
+        "listing[0]()",
+        "mapping[\"callback\"]()",
+    ] {
+        std::fs::write(dir.join("dep.pkl"), format!("good = true\nresult = (new Mapping {{\nlocal get = () -> `module`.good\nlocal holder = new Dynamic {{ callback = get }}\nlocal copies = List(get)\nlocal listing = new Listing {{ get }}\nlocal mapping = new Mapping {{ [\"callback\"] = get }}\nlocal `module` = new Dynamic {{ good = false }}\n[\"ok\"] = {call}\n}})[\"ok\"]\n")).unwrap();
         let value = pklr::eval_to_json(&dir.join("main.pkl"))
             .unwrap_or_else(|error| panic!("{call}: {error}"));
         assert_eq!(value, serde_json::json!({"result": true}));
@@ -2503,6 +2510,80 @@ fn narrowed_import_keeps_eager_user_defined_pair_calls() {
 }
 
 #[test]
+fn narrowed_import_follows_aliased_amendment_bindings() {
+    let temp = TestTempDir::new("pklr_test_narrowed_import_amendment_aliases");
+    let dir = temp.path();
+    std::fs::write(
+        dir.join("main.pkl"),
+        "import \"dep.pkl\" as Dep\nresult = Dep.result\n",
+    )
+    .unwrap();
+    for base in [
+        "let (base = new Listing { false }) (base)",
+        "let (initial = new Listing { false }) let (base = initial) (base)",
+        "(let (base = new Listing { false }) base)",
+    ] {
+        std::fs::write(dir.join("dep.pkl"), format!("good = true\nresult = let (real = module) let (receiver = new Dynamic {{ good = false }}) ({base} {{\nlocal `module` = receiver\nlocal receiver = real\n[0] = `module`.good\n}}).first\n")).unwrap();
+        let value = pklr::eval_to_json(&dir.join("main.pkl"))
+            .unwrap_or_else(|error| panic!("{base}: {error}"));
+        assert_eq!(value, serde_json::json!({"result": true}));
+        std::fs::write(dir.join("dep.pkl"), format!("bad = import(\"missing.pkl\")\nresult = ({base} {{\nlocal early = bad\nlocal bad = true\n[0] = early\n}}).first\n")).unwrap();
+        let value = pklr::eval_to_json(&dir.join("main.pkl"))
+            .unwrap_or_else(|error| panic!("{base}: {error}"));
+        assert_eq!(value, serde_json::json!({"result": true}));
+    }
+    std::fs::write(dir.join("dep.pkl"), "good = true\nresult = let (real = module) let (receiver = new Dynamic { good = false }) (new Mapping {\nlocal initial = new Listing { false }\nlocal base = initial\n[\"ok\"] = ((base) {\nlocal `module` = receiver\nlocal receiver = real\n[0] = `module`.good\n}).first\n})[\"ok\"]\n").unwrap();
+    let value = pklr::eval_to_json(&dir.join("main.pkl")).unwrap();
+    assert_eq!(value, serde_json::json!({"result": true}));
+    std::fs::write(dir.join("dep.pkl"), "bad = import(\"missing.pkl\")\nresult = ((base) -> ((base) {\nlocal early = bad\nlocal bad = true\n[0] = early\n}).first)(new Listing { false })\n").unwrap();
+    let value = pklr::eval_to_json(&dir.join("main.pkl")).unwrap();
+    assert_eq!(value, serde_json::json!({"result": true}));
+}
+
+#[test]
+fn narrowed_import_ignores_builtin_collection_receivers() {
+    let temp = TestTempDir::new("pklr_test_narrowed_import_collection_receivers");
+    let dir = temp.path();
+    std::fs::write(
+        dir.join("main.pkl"),
+        "import \"dep.pkl\" as Dep\nresult = (new Dep.C {}).ok\n",
+    )
+    .unwrap();
+    for value in [
+        "List(true)",
+        "Listing(true)",
+        "Set(true)",
+        "Map(\"one\", true)",
+        "List(module.good)",
+    ] {
+        std::fs::write(dir.join("dep.pkl"), format!("length = import(\"missing.pkl\")\ngood = true\nclass C {{ ok: Boolean(let (`module` = {value}) `module`.length == 1) = true }}\n")).unwrap();
+        let value = pklr::eval_to_json(&dir.join("main.pkl"))
+            .unwrap_or_else(|error| panic!("{value}: {error}"));
+        assert_eq!(value, serde_json::json!({"result": true}));
+    }
+}
+
+#[test]
+fn narrowed_import_ignores_fixed_non_module_class_receivers() {
+    let temp = TestTempDir::new("pklr_test_narrowed_import_fixed_receivers");
+    let dir = temp.path();
+    std::fs::write(
+        dir.join("main.pkl"),
+        "import \"dep.pkl\" as Dep\nresult = (new Dep.C {}).ok\n",
+    )
+    .unwrap();
+    for modifier in ["fixed", "const"] {
+        std::fs::write(dir.join("dep.pkl"), format!("bad = import(\"missing.pkl\")\nclass C {{\n{modifier} `module` = new Dynamic {{ bad = true }}\nok = `module`.bad\n}}\n")).unwrap();
+        let value = pklr::eval_to_json(&dir.join("main.pkl"))
+            .unwrap_or_else(|error| panic!("{modifier}: {error}"));
+        assert_eq!(value, serde_json::json!({"result": true}));
+    }
+    std::fs::write(dir.join("dep.pkl"), "good = true\nclass C {\nfixed `module` = new Dynamic { bad = good }\nok = `module`.bad\n}\n").unwrap();
+    let value = pklr::eval_to_json(&dir.join("main.pkl")).unwrap();
+    assert_eq!(value, serde_json::json!({"result": true}));
+}
+
+#[test]
 fn narrowed_import_keeps_pending_object_property_shadows() {
     let temp = TestTempDir::new("pklr_test_narrowed_import_pending_properties");
     let dir = temp.path();
@@ -2528,10 +2609,21 @@ fn narrowed_import_preserves_typed_mapping_amendment_phases() {
         "import \"dep.pkl\" as Dep\nresult = Dep.result\n",
     )
     .unwrap();
-    std::fs::write(dir.join("dep.pkl"), "bad = import(\"missing.pkl\")\nresult = (new Mapping<String, Boolean> {} {\nlocal get = () -> `module`.bad\nlocal `module` = new Dynamic { bad = true }\n[\"ok\"] = get()\n})[\"ok\"]\n").unwrap();
-    let value = pklr::eval_to_json(&dir.join("main.pkl")).unwrap();
-    assert_eq!(value, serde_json::json!({"result": true}));
-    for base in ["new Dynamic {}", "new Mapping {}"] {
+    for base in [
+        "new Mapping<String, Boolean> {}",
+        "let (initial = new Mapping<String, Boolean> {}) let (base = initial) (base)",
+        "let (base = new Mapping { default = true }) (base)",
+    ] {
+        std::fs::write(dir.join("dep.pkl"), format!("bad = import(\"missing.pkl\")\nresult = ({base} {{\nlocal get = () -> `module`.bad\nlocal `module` = new Dynamic {{ bad = true }}\n[\"ok\"] = get()\n}})[\"ok\"]\n")).unwrap();
+        let value = pklr::eval_to_json(&dir.join("main.pkl"))
+            .unwrap_or_else(|error| panic!("{base}: {error}"));
+        assert_eq!(value, serde_json::json!({"result": true}));
+    }
+    for base in [
+        "new Dynamic {}",
+        "new Mapping {}",
+        "let (initial = new Mapping {}) let (base = initial) (base)",
+    ] {
         std::fs::write(dir.join("dep.pkl"), format!("good = true\nresult = ({base} {{\nlocal get = () -> `module`.good\nlocal `module` = new Dynamic {{ good = false }}\n[\"ok\"] = get()\n}})[\"ok\"]\n")).unwrap();
         let value = pklr::eval_to_json(&dir.join("main.pkl"))
             .unwrap_or_else(|error| panic!("{base}: {error}"));

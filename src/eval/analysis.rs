@@ -438,7 +438,7 @@ pub(super) fn expand_requested_fields(
                             expr,
                             &mut refs.values,
                             true,
-                            &HashSet::default(),
+                            &Names::default(),
                             aliases,
                         );
                     }
@@ -453,7 +453,7 @@ pub(super) fn expand_requested_fields(
                         collect_sibling_field_refs_entries_in(
                             body,
                             &mut refs.values,
-                            &HashSet::default(),
+                            &Names::default(),
                             aliases,
                         );
                     }
@@ -562,7 +562,7 @@ fn follow_definitions(definitions: &Definitions, refs: &mut Names, aliases: Opti
             collect_sibling_field_refs_entries_in(
                 std::slice::from_ref(*definition),
                 &mut definition_refs.values,
-                &HashSet::default(),
+                &Names::default(),
                 aliases,
             );
         }
@@ -582,7 +582,7 @@ fn follow_definitions(definitions: &Definitions, refs: &mut Names, aliases: Opti
                 collect_sibling_field_refs_type_in(
                     ty,
                     &mut local_refs.values,
-                    &HashSet::default(),
+                    &Names::default(),
                     Some(definitions.module_aliases),
                 );
             }
@@ -591,7 +591,7 @@ fn follow_definitions(definitions: &Definitions, refs: &mut Names, aliases: Opti
                     expr,
                     &mut local_refs.values,
                     true,
-                    &HashSet::default(),
+                    &Names::default(),
                     Some(definitions.module_aliases),
                 );
             }
@@ -599,7 +599,7 @@ fn follow_definitions(definitions: &Definitions, refs: &mut Names, aliases: Opti
                 collect_sibling_field_refs_entries_in(
                     body,
                     &mut local_refs.values,
-                    &HashSet::default(),
+                    &Names::default(),
                     Some(definitions.module_aliases),
                 );
             }
@@ -627,7 +627,7 @@ fn follow_definitions(definitions: &Definitions, refs: &mut Names, aliases: Opti
 }
 
 pub(super) fn collect_sibling_field_refs_entries(entries: &[Entry], refs: &mut HashSet<String>) {
-    collect_sibling_field_refs_entries_in(entries, refs, &HashSet::default(), None);
+    collect_sibling_field_refs_entries_in(entries, refs, &Names::default(), None);
 }
 
 // Match eval_listing_entries: dependencies precede their readers, while cycles
@@ -722,8 +722,31 @@ impl BodyEvaluation {
         }
     }
 
-    fn amendment(base: &Expr, entries: &[Entry], aliases: Option<&TypeAliases>) -> Self {
+    fn amendment(
+        base: &Expr,
+        entries: &[Entry],
+        aliases: Option<&TypeAliases>,
+        bindings: &HashMap<String, Self>,
+    ) -> Self {
+        Self::amendment_kind(base, aliases, bindings).unwrap_or_else(|| Self::new(None, entries))
+    }
+
+    fn amendment_kind(
+        base: &Expr,
+        aliases: Option<&TypeAliases>,
+        bindings: &HashMap<String, Self>,
+    ) -> Option<Self> {
         match base {
+            Expr::Ident(name) => bindings.get(name).copied(),
+            Expr::Let(name, value, result) => {
+                let mut bindings = bindings.clone();
+                if let Some(kind) = Self::amendment_kind(value, aliases, &bindings) {
+                    bindings.insert(name.clone(), kind);
+                } else {
+                    bindings.remove(name);
+                }
+                Self::amendment_kind(result, aliases, &bindings)
+            }
             Expr::New(name, body, params) => {
                 let kind = Self::new(name.as_deref(), body);
                 if kind == Self::Mapping
@@ -734,16 +757,16 @@ impl BodyEvaluation {
                 {
                     // Untyped Mappings use eval_amended_object rather than
                     // the specialized typed/default Mapping entry evaluator.
-                    Self::Object
+                    Some(Self::Object)
                 } else {
-                    kind
+                    Some(kind)
                 }
             }
-            Expr::InferredNew(ty, body) => Self::inferred(ty, body, aliases),
+            Expr::InferredNew(ty, body) => Some(Self::inferred(ty, body, aliases)),
             Expr::Binop(BinOp::Add, base, _) | Expr::Trace(base, _) => {
-                Self::amendment(base, entries, aliases)
+                Self::amendment_kind(base, aliases, bindings)
             }
-            _ => Self::new(None, entries),
+            _ => None,
         }
     }
 }
@@ -829,7 +852,7 @@ fn early_local_lambda_refs(entries: &[Entry], evaluation: BodyEvaluation) -> Has
 fn collect_sibling_field_refs_entries_in(
     entries: &[Entry],
     refs: &mut HashSet<String>,
-    shadows: &HashSet<String>,
+    shadows: &Names,
     aliases: Option<&TypeAliases>,
 ) {
     collect_sibling_field_refs_entries_ordered(
@@ -844,7 +867,7 @@ fn collect_sibling_field_refs_entries_in(
 fn collect_sibling_field_refs_entries_ordered(
     entries: &[Entry],
     refs: &mut HashSet<String>,
-    shadows: &HashSet<String>,
+    shadows: &Names,
     evaluation: BodyEvaluation,
     aliases: Option<&TypeAliases>,
 ) {
@@ -866,7 +889,12 @@ fn collect_sibling_field_refs_entries_ordered(
     {
         let aliases = Some(entry_aliases.as_ref());
         match entry {
-            Entry::Property(prop) if listing || has_modifier(&prop.modifiers, Modifier::Local) => {
+            Entry::Property(prop)
+                if listing
+                    || has_modifier(&prop.modifiers, Modifier::Local)
+                    || has_modifier(&prop.modifiers, Modifier::Fixed)
+                    || has_modifier(&prop.modifiers, Modifier::Const) =>
+            {
                 if let Some(expr) = &prop.value
                     && expr_mentions(expr, "super")
                 {
@@ -897,16 +925,21 @@ fn collect_sibling_field_refs_entries_ordered(
                     || prop
                         .value
                         .as_ref()
-                        .is_some_and(|value| is_non_module_value(value, &entry_shadows))
+                        .is_some_and(|value| is_non_module_value(value, &entry_shadows.values))
                 {
-                    entry_shadows.insert(prop.name.clone());
+                    entry_shadows.values.insert(prop.name.clone());
                 } else {
-                    entry_shadows.remove(&prop.name);
+                    entry_shadows.values.remove(&prop.name);
                 }
+                let kind = prop.value.as_ref().and_then(|value| {
+                    BodyEvaluation::amendment_kind(value, aliases, &entry_shadows.amendment_kinds)
+                });
+                entry_shadows.bind_amendment(&prop.name, kind);
             }
             Entry::ClassDef(name, _, _, body) => {
                 collect_sibling_field_refs_entries_in(body, refs, &entry_shadows, aliases);
-                entry_shadows.insert(name.clone());
+                entry_shadows.values.insert(name.clone());
+                entry_shadows.bind_amendment(name, None);
                 entry_aliases.to_mut().insert(name.as_str(), None);
             }
             Entry::TypeAlias(name, ty) => {
@@ -914,7 +947,8 @@ fn collect_sibling_field_refs_entries_ordered(
             }
             Entry::Property(prop) => {
                 // An overridable property may be amended to the real module.
-                entry_shadows.remove(&prop.name);
+                entry_shadows.values.remove(&prop.name);
+                entry_shadows.bind_amendment(&prop.name, None);
             }
             _ => {}
         }
@@ -924,7 +958,9 @@ fn collect_sibling_field_refs_entries_ordered(
         match entry {
             Entry::Property(prop)
                 if listing
-                    || (has_modifier(&prop.modifiers, Modifier::Local)
+                    || ((has_modifier(&prop.modifiers, Modifier::Local)
+                        || has_modifier(&prop.modifiers, Modifier::Fixed)
+                        || has_modifier(&prop.modifiers, Modifier::Const))
                         && !matches!(prop.value, Some(Expr::Lambda(..)))) => {}
             Entry::Property(prop) => {
                 if let Some(ty) = &prop.type_ann {
@@ -956,28 +992,30 @@ fn collect_sibling_field_refs_entries_ordered(
                 let non_module_values = match &fgen.collection {
                     Expr::Call(callee, args) => match callee.as_ref() {
                         Expr::Ident(name) if matches!(name.as_str(), "List" | "Listing" | "Set") => {
-                            args.iter().all(|arg| is_non_module_value(arg, &entry_shadows))
+                            args.iter().all(|arg| is_non_module_value(arg, &entry_shadows.values))
                         }
                         Expr::Ident(name) if name == "Map" => args
                             .iter()
                             .skip(1)
                             .step_by(2)
-                            .all(|arg| is_non_module_value(arg, &entry_shadows)),
+                            .all(|arg| is_non_module_value(arg, &entry_shadows.values)),
                         _ => false,
                     },
                     Expr::New(Some(name), body, _) if name == "Listing" => body.iter().all(
-                        |entry| matches!(entry, Entry::Elem(value) if is_non_module_value(value, &entry_shadows)),
+                        |entry| matches!(entry, Entry::Elem(value) if is_non_module_value(value, &entry_shadows.values)),
                     ),
                     _ => false,
                 };
                 if non_module_values {
-                    body_shadows.insert(fgen.val_var.clone());
+                    body_shadows.values.insert(fgen.val_var.clone());
                 } else {
-                    body_shadows.remove(&fgen.val_var);
+                    body_shadows.values.remove(&fgen.val_var);
                 }
+                body_shadows.bind_amendment(&fgen.val_var, None);
                 if let Some(key_var) = &fgen.key_var {
                     // collection_to_items always binds an integer or string key.
-                    body_shadows.insert(key_var.clone());
+                    body_shadows.values.insert(key_var.clone());
+                    body_shadows.bind_amendment(key_var, None);
                 }
                 collect_sibling_field_refs_entries_ordered(
                     &fgen.body,
@@ -1079,9 +1117,19 @@ struct Names {
     /// may still name a module property or local holding a class (see
     /// `follow_definitions`).
     unbound_types: HashSet<String>,
+    /// Known lexical values' amendment evaluators. Unlike types, these follow
+    /// value shadowing, including aliases and dependency-ordered Listing locals.
+    amendment_kinds: HashMap<String, BodyEvaluation>,
 }
 
 impl Names {
+    fn bind_amendment(&mut self, name: &str, kind: Option<BodyEvaluation>) {
+        if let Some(kind) = kind {
+            self.amendment_kinds.insert(name.to_string(), kind);
+        } else {
+            self.amendment_kinds.remove(name);
+        }
+    }
     fn values(values: &HashSet<String>) -> Self {
         Names {
             values: values.clone(),
@@ -1090,6 +1138,9 @@ impl Names {
     }
 
     fn extend(&mut self, other: Names) {
+        self.amendment_kinds
+            .retain(|name, _| !other.values.contains(name));
+        self.amendment_kinds.extend(other.amendment_kinds);
         self.values.extend(other.values);
         self.types.extend(other.types);
         self.unbound_types.extend(other.unbound_types);
@@ -1343,13 +1394,13 @@ fn constraint_bound_names_resolving(
 /// `module.field` reads in a type's constraints, which run when a value is
 /// checked against it.
 fn collect_sibling_field_refs_type(ty: &crate::parser::TypeExpr, refs: &mut HashSet<String>) {
-    collect_sibling_field_refs_type_in(ty, refs, &HashSet::default(), None);
+    collect_sibling_field_refs_type_in(ty, refs, &Names::default(), None);
 }
 
 fn collect_sibling_field_refs_type_in(
     ty: &crate::parser::TypeExpr,
     refs: &mut HashSet<String>,
-    shadows: &HashSet<String>,
+    shadows: &Names,
     aliases: Option<&TypeAliases>,
 ) {
     match ty {
@@ -1373,7 +1424,7 @@ pub(super) fn collect_sibling_field_refs_expr(
     refs: &mut HashSet<String>,
     include_this: bool,
 ) {
-    collect_sibling_field_refs_expr_in(expr, refs, include_this, &HashSet::default(), None);
+    collect_sibling_field_refs_expr_in(expr, refs, include_this, &Names::default(), None);
 }
 
 // A quoted `module` (or `this`) may name a non-module lexical value instead
@@ -1383,6 +1434,9 @@ pub(super) fn collect_sibling_field_refs_expr(
 fn is_non_module_value(expr: &Expr, shadows: &HashSet<String>) -> bool {
     match expr {
         Expr::Ident(name) => shadows.contains(name),
+        Expr::Call(callee, _) if matches!(callee.as_ref(), Expr::Ident(name) if matches!(name.as_str(), "List" | "Listing" | "Map" | "Set")) => {
+            true
+        }
         Expr::New(..)
         | Expr::InferredNew(..)
         | Expr::ObjectBody(..)
@@ -1401,13 +1455,13 @@ fn collect_sibling_field_refs_expr_in(
     expr: &Expr,
     refs: &mut HashSet<String>,
     include_this: bool,
-    shadows: &HashSet<String>,
+    shadows: &Names,
     aliases: Option<&TypeAliases>,
 ) {
     match expr {
         Expr::Field(base, field) | Expr::NullSafeField(base, field) => {
             if is_module_sibling_ref(base, include_this)
-                && matches!(base.as_ref(), Expr::Ident(name) if !shadows.contains(name))
+                && matches!(base.as_ref(), Expr::Ident(name) if !shadows.values.contains(name))
             {
                 refs.insert(field.clone());
             }
@@ -1415,7 +1469,7 @@ fn collect_sibling_field_refs_expr_in(
         }
         Expr::Index(base, index) => {
             if is_module_sibling_ref(base, include_this)
-                && matches!(base.as_ref(), Expr::Ident(name) if !shadows.contains(name))
+                && matches!(base.as_ref(), Expr::Ident(name) if !shadows.values.contains(name))
             {
                 if let Expr::String(key) = index.as_ref() {
                     refs.insert(key.to_string());
@@ -1435,7 +1489,7 @@ fn collect_sibling_field_refs_expr_in(
                     entries,
                     refs,
                     shadows,
-                    BodyEvaluation::amendment(left, entries, aliases),
+                    BodyEvaluation::amendment(left, entries, aliases, &shadows.amendment_kinds),
                     aliases,
                 );
             } else {
@@ -1446,7 +1500,7 @@ fn collect_sibling_field_refs_expr_in(
             // `new module.C {}` reads the module member `C`.
             if let Some((root, rest)) = type_name.as_deref().and_then(|name| name.split_once('.'))
                 && (root == "module" || (include_this && root == "this"))
-                && !shadows.contains(root)
+                && !shadows.values.contains(root)
             {
                 let member = rest.split('.').next().unwrap_or(rest);
                 refs.insert(member.to_string());
@@ -1478,12 +1532,17 @@ fn collect_sibling_field_refs_expr_in(
             if let Expr::Lambda(params, body) = callee.as_ref() {
                 let mut body_shadows = shadows.clone();
                 for param in params.iter() {
-                    body_shadows.remove(param);
+                    body_shadows.values.remove(param);
+                    body_shadows.bind_amendment(param, None);
                 }
                 for (param, arg) in params.iter().zip(args) {
-                    if is_non_module_value(arg, shadows) {
-                        body_shadows.insert(param.clone());
+                    if is_non_module_value(arg, &shadows.values) {
+                        body_shadows.values.insert(param.clone());
                     }
+                    body_shadows.bind_amendment(
+                        param,
+                        BodyEvaluation::amendment_kind(arg, aliases, &shadows.amendment_kinds),
+                    );
                 }
                 collect_sibling_field_refs_expr_in(
                     body,
@@ -1504,11 +1563,15 @@ fn collect_sibling_field_refs_expr_in(
         Expr::Let(name, value, body) => {
             collect_sibling_field_refs_expr_in(value, refs, include_this, shadows, aliases);
             let mut body_shadows = shadows.clone();
-            if is_non_module_value(value, shadows) {
-                body_shadows.insert(name.clone());
+            if is_non_module_value(value, &shadows.values) {
+                body_shadows.values.insert(name.clone());
             } else {
-                body_shadows.remove(name);
+                body_shadows.values.remove(name);
             }
+            body_shadows.bind_amendment(
+                name,
+                BodyEvaluation::amendment_kind(value, aliases, &shadows.amendment_kinds),
+            );
             collect_sibling_field_refs_expr_in(body, refs, include_this, &body_shadows, aliases);
         }
         Expr::Is(value, ty) | Expr::As(value, ty) => {
@@ -1519,7 +1582,8 @@ fn collect_sibling_field_refs_expr_in(
         Expr::Lambda(params, body) => {
             let mut body_shadows = shadows.clone();
             for param in params.iter() {
-                body_shadows.remove(param);
+                body_shadows.values.remove(param);
+                body_shadows.bind_amendment(param, None);
             }
             collect_sibling_field_refs_expr_in(body, refs, include_this, &body_shadows, aliases);
         }
@@ -2130,7 +2194,9 @@ fn stored_methods(
             Expr::New(None, entries, _) | Expr::ObjectBody(entries) if composites => {
                 stored_entries(entries, names)
             }
-            Expr::New(Some(name), entries, _) if composites && name == "Dynamic" => {
+            Expr::New(Some(name), entries, _)
+                if composites && matches!(name.as_str(), "Dynamic" | "Listing" | "Mapping") =>
+            {
                 stored_entries(entries, names)
             }
             Expr::Call(callee, args)
@@ -2871,6 +2937,10 @@ fn collect_entry_refs_unnarrowed_ordered(
                         || has_modifier(&prop.modifiers, Modifier::Const))
                 {
                     active.to_mut().values.extend(pending.iter().cloned());
+                    active
+                        .to_mut()
+                        .amendment_kinds
+                        .retain(|name, _| !pending.contains(name));
                 }
                 if let Some(ty) = &prop.type_ann {
                     collect_type_refs(ty, refs, &active, aliases, definitions);
@@ -2885,14 +2955,18 @@ fn collect_entry_refs_unnarrowed_ordered(
                 if let Some(body) = &prop.body {
                     collect_entry_refs_in(body, refs, &active, aliases, definitions);
                 }
-                initializer_shadows
-                    .to_mut()
-                    .values
-                    .insert(prop.name.clone());
+                let kind = prop.value.as_ref().and_then(|value| {
+                    BodyEvaluation::amendment_kind(value, aliases, &active.amendment_kinds)
+                });
+                let initializer_shadows = initializer_shadows.to_mut();
+                initializer_shadows.values.insert(prop.name.clone());
+                initializer_shadows.bind_amendment(&prop.name, kind);
+                entry_shadows.bind_amendment(&prop.name, kind);
             }
             Entry::ClassDef(name, ..) => {
                 let initializer_shadows = initializer_shadows.to_mut();
                 initializer_shadows.values.insert(name.clone());
+                initializer_shadows.bind_amendment(name, None);
                 initializer_shadows.types.insert(name.clone());
                 entry_aliases.to_mut().insert(name.as_str(), None);
             }
@@ -2929,8 +3003,10 @@ fn collect_entry_refs_unnarrowed_ordered(
                 collect_expr_refs_in(&fgen.collection, refs, &entry_shadows, aliases, definitions);
                 let mut body_shadows = entry_shadows.clone();
                 body_shadows.values.insert(fgen.val_var.clone());
+                body_shadows.bind_amendment(&fgen.val_var, None);
                 if let Some(key_var) = &fgen.key_var {
                     body_shadows.values.insert(key_var.clone());
+                    body_shadows.bind_amendment(key_var, None);
                 }
                 collect_entry_refs_ordered(
                     &fgen.body,
@@ -3175,7 +3251,7 @@ fn collect_expr_refs_in(
                     shadows,
                     aliases,
                     definitions,
-                    BodyEvaluation::amendment(base, entries, aliases),
+                    BodyEvaluation::amendment(base, entries, aliases, &shadows.amendment_kinds),
                 );
             }
         }
@@ -3184,9 +3260,24 @@ fn collect_expr_refs_in(
             collect_expr_refs_in(index, refs, shadows, aliases, definitions);
         }
         Expr::Call(callee, args) => {
-            collect_expr_refs_in(callee, refs, shadows, aliases, definitions);
             for arg in args {
                 collect_expr_refs_in(arg, refs, shadows, aliases, definitions);
+            }
+            if let Expr::Lambda(params, body) = callee.as_ref() {
+                let mut body_shadows = shadows.clone();
+                body_shadows.values.extend(params.iter().cloned());
+                for param in params.iter() {
+                    body_shadows.bind_amendment(param, None);
+                }
+                for (param, arg) in params.iter().zip(args) {
+                    body_shadows.bind_amendment(
+                        param,
+                        BodyEvaluation::amendment_kind(arg, aliases, &shadows.amendment_kinds),
+                    );
+                }
+                collect_expr_refs_in(body, refs, &body_shadows, aliases, definitions);
+            } else {
+                collect_expr_refs_in(callee, refs, shadows, aliases, definitions);
             }
         }
         Expr::If(cond, then_expr, else_expr) => {
@@ -3198,6 +3289,10 @@ fn collect_expr_refs_in(
             collect_expr_refs_in(value, refs, shadows, aliases, definitions);
             let mut body_shadows = shadows.clone();
             body_shadows.values.insert(name.clone());
+            body_shadows.bind_amendment(
+                name,
+                BodyEvaluation::amendment_kind(value, aliases, &shadows.amendment_kinds),
+            );
             collect_expr_refs_in(body, refs, &body_shadows, aliases, definitions);
         }
         Expr::Is(value, ty) | Expr::As(value, ty) => {
@@ -3207,6 +3302,9 @@ fn collect_expr_refs_in(
         Expr::Lambda(params, value) => {
             let mut body_shadows = shadows.clone();
             body_shadows.values.extend(params.iter().cloned());
+            for param in params.iter() {
+                body_shadows.bind_amendment(param, None);
+            }
             collect_expr_refs_in(value, refs, &body_shadows, aliases, definitions);
         }
         Expr::Unop(_, value)
@@ -3278,6 +3376,9 @@ fn collect_type_refs(
             // A type check binds the checked value's own names inside the
             // constraint, so they are not references to the enclosing scope.
             let mut constraint_shadows = shadows.clone();
+            for name in constraint_bound_names_resolving(base, aliases) {
+                constraint_shadows.bind_amendment(name, None);
+            }
             constraint_shadows.values.extend(
                 constraint_bound_names_resolving(base, aliases)
                     .iter()
