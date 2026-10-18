@@ -2268,6 +2268,35 @@ fn narrowed_import_ignores_shadowed_module_receivers_in_constraints() {
 }
 
 #[test]
+fn narrowed_import_ignores_non_module_generator_receivers() {
+    let temp = TestTempDir::new("pklr_test_narrowed_import_generator_receiver");
+    let dir = temp.path();
+    std::fs::write(
+        dir.join("main.pkl"),
+        "import \"dep.pkl\" as Dep\nresult = new Dep.C {}\n",
+    )
+    .unwrap();
+    for constraint in [
+        "(new Listing { for (`module` in List(new Dynamic { bad = module.good })) { `module`.bad } }).first",
+        "(new Listing { for (`module` in new Listing { new Dynamic { bad = module.good } }) { `module`.bad } }).first",
+        "(new Listing { for (`module`, value in List(true)) { `module`.isPositive } }).first",
+        "(new Listing { for (`module` in Map(\"key\", new Dynamic { bad = module.good })) { `module`.bad } }).first",
+        "(new Listing { for (`module`, value in Map(\"key\", true)) { !`module`.isEmpty } }).first",
+    ] {
+        std::fs::write(
+            dir.join("dep.pkl"),
+            format!(
+                "bad = import(\"missing.pkl\")\nisPositive = import(\"missing.pkl\")\nisEmpty = import(\"missing.pkl\")\ngood = true\ntypealias Check = Boolean({constraint})\nclass C {{ ok: Check = true }}\n"
+            ),
+        )
+        .unwrap();
+        let value = pklr::eval_to_json(&dir.join("main.pkl"))
+            .unwrap_or_else(|error| panic!("{constraint}: {error}"));
+        assert_eq!(value, serde_json::json!({"result": {"ok": true}}));
+    }
+}
+
+#[test]
 fn narrowed_import_keeps_module_reads_in_local_initializers() {
     let temp = TestTempDir::new("pklr_test_narrowed_import_local_module_initializer");
     let dir = temp.path();
@@ -2279,6 +2308,40 @@ fn narrowed_import_keeps_module_reads_in_local_initializers() {
     std::fs::write(
         dir.join("main.pkl"),
         "import \"dep.pkl\" as Dep\nresult = Dep.result\n",
+    )
+    .unwrap();
+    let value = pklr::eval_to_json(&dir.join("main.pkl")).unwrap();
+    assert_eq!(value, serde_json::json!({"result": true}));
+
+    std::fs::write(
+        dir.join("dep.pkl"),
+        "good = import(\"missing.pkl\")\nresult = let (`module` = new Dynamic { good = true }) (new Mapping {\nlocal `module` = `module`\n[\"ok\"] = `module`.good\n})[\"ok\"]\n",
+    )
+    .unwrap();
+    let value = pklr::eval_to_json(&dir.join("main.pkl")).unwrap();
+    assert_eq!(value, serde_json::json!({"result": true}));
+}
+
+#[test]
+fn narrowed_import_keeps_module_reads_in_late_listing_locals() {
+    let temp = TestTempDir::new("pklr_test_narrowed_import_late_listing_locals");
+    let dir = temp.path();
+    std::fs::write(
+        dir.join("main.pkl"),
+        "import \"dep.pkl\" as Dep\nresult = Dep.result\n",
+    )
+    .unwrap();
+    std::fs::write(
+        dir.join("dep.pkl"),
+        "good = true\nresult = (let (real = module) let (receiver = new Dynamic { good = false }) new Listing {\nlocal `module` = receiver\nlocal receiver = real\n`module`.good\n}).first\n",
+    )
+    .unwrap();
+    let value = pklr::eval_to_json(&dir.join("main.pkl")).unwrap();
+    assert_eq!(value, serde_json::json!({"result": true}));
+
+    std::fs::write(
+        dir.join("dep.pkl"),
+        "bad = import(\"missing.pkl\")\nresult = (new Listing {\nlocal get = bad\nlocal bad = true\nget\n}).first\n",
     )
     .unwrap();
     let value = pklr::eval_to_json(&dir.join("main.pkl")).unwrap();
@@ -2301,6 +2364,16 @@ fn narrowed_import_keeps_module_reads_in_rebound_local_lambdas() {
     .unwrap();
     let value = pklr::eval_to_json(&dir.join("main.pkl")).unwrap();
     assert_eq!(value, serde_json::json!({"result": true}));
+
+    // A deferred lambda's bare read sees a later local, not an unrelated
+    // module property with the same name.
+    std::fs::write(
+        dir.join("dep.pkl"),
+        "bad = import(\"missing.pkl\")\nresult = (new Mapping {\nlocal get = () -> bad\nlocal bad = true\n[\"ok\"] = get()\n})[\"ok\"]\n",
+    )
+    .unwrap();
+    let value = pklr::eval_to_json(&dir.join("main.pkl")).unwrap();
+    assert_eq!(value, serde_json::json!({"result": true}));
 }
 
 #[test]
@@ -2319,6 +2392,8 @@ fn narrowed_import_keeps_module_receiver_alias_constraints() {
         "((`module`) -> `module`.good)(module)",
         "let (`module` = if (true) module else new Dynamic { good = false }) `module`.good",
         "(new Mapping { local `module` = module; [\"ok\"] = `module`.good })[\"ok\"]",
+        "(new Listing { for (`module` in List(module)) { `module`.good } }).first",
+        "(new Listing { for (`module` in new Listing { module }) { `module`.good } }).first",
     ] {
         std::fs::write(
             dir.join("dep.pkl"),

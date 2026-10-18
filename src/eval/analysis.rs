@@ -607,12 +607,22 @@ fn collect_sibling_field_refs_entries_in(
     shadows: &HashSet<String>,
 ) {
     let mut entry_shadows = shadows.clone();
-    // Locals are evaluated before binding their own name, in declaration
-    // order. Lambda locals can be called then and are also rebound after
-    // the locals, so collect their bodies in both capture scopes.
+    // An inherited binding says nothing about a same-named binding in this
+    // body: Listing locals can be evaluated out of declaration order.
+    if !entry_shadows.is_empty() {
+        let declared = declared_entry_names(entries);
+        entry_shadows.retain(|name| !declared.values.contains(name));
+    }
+    // Scan initializers before adding their binding. Lambda locals can be
+    // called then and are also rebound after the locals, so collect their
+    // bodies in both capture scopes.
     for entry in entries {
         match entry {
             Entry::Property(prop) if has_modifier(&prop.modifiers, Modifier::Local) => {
+                // The initializer can still read its own outer binding.
+                if shadows.contains(&prop.name) {
+                    entry_shadows.insert(prop.name.clone());
+                }
                 if let Some(ty) = &prop.type_ann {
                     collect_sibling_field_refs_type_in(ty, refs, &entry_shadows);
                 }
@@ -666,9 +676,34 @@ fn collect_sibling_field_refs_entries_in(
             Entry::ForGenerator(fgen) => {
                 collect_sibling_field_refs_expr_in(&fgen.collection, refs, false, &entry_shadows);
                 let mut body_shadows = entry_shadows.clone();
-                body_shadows.remove(&fgen.val_var);
+                // eval_call handles these collection constructors directly.
+                // Unknown items may still alias the module, so retain their
+                // dependencies rather than treating every generator as a shadow.
+                let non_module_values = match &fgen.collection {
+                    Expr::Call(callee, args) => match callee.as_ref() {
+                        Expr::Ident(name) if matches!(name.as_str(), "List" | "Listing" | "Set") => {
+                            args.iter().all(|arg| is_non_module_value(arg, &entry_shadows))
+                        }
+                        Expr::Ident(name) if name == "Map" => args
+                            .iter()
+                            .skip(1)
+                            .step_by(2)
+                            .all(|arg| is_non_module_value(arg, &entry_shadows)),
+                        _ => false,
+                    },
+                    Expr::New(Some(name), body, _) if name == "Listing" => body.iter().all(
+                        |entry| matches!(entry, Entry::Elem(value) if is_non_module_value(value, &entry_shadows)),
+                    ),
+                    _ => false,
+                };
+                if non_module_values {
+                    body_shadows.insert(fgen.val_var.clone());
+                } else {
+                    body_shadows.remove(&fgen.val_var);
+                }
                 if let Some(key_var) = &fgen.key_var {
-                    body_shadows.remove(key_var);
+                    // collection_to_items always binds an integer or string key.
+                    body_shadows.insert(key_var.clone());
                 }
                 collect_sibling_field_refs_entries_in(&fgen.body, refs, &body_shadows);
             }
@@ -2321,17 +2356,23 @@ fn collect_entry_refs_unnarrowed(
     aliases: Option<&TypeAliases>,
     definitions: Option<&Definitions>,
 ) {
-    let mut initializer_shadows = shadows.clone();
     let mut entry_shadows = shadows.clone();
     entry_shadows.extend(declared_entry_names(entries));
     for entry in entries {
         match entry {
             Entry::Property(prop) => {
-                let property_shadows = if has_modifier(&prop.modifiers, Modifier::Local) {
-                    &initializer_shadows
-                } else {
-                    &entry_shadows
-                };
+                // A local's own name is not bound during its initializer.
+                // Keep sibling bindings: Listing locals are dependency-ordered,
+                // and deferred lambdas capture the completed body scope.
+                let initializer_shadows = (has_modifier(&prop.modifiers, Modifier::Local)
+                    && !matches!(prop.value, Some(Expr::Lambda(..)))
+                    && !shadows.values.contains(&prop.name))
+                .then(|| {
+                    let mut initializer_shadows = entry_shadows.clone();
+                    initializer_shadows.values.remove(&prop.name);
+                    initializer_shadows
+                });
+                let property_shadows = initializer_shadows.as_ref().unwrap_or(&entry_shadows);
                 if let Some(ty) = &prop.type_ann {
                     collect_type_refs(ty, refs, property_shadows, aliases, definitions);
                 }
@@ -2375,7 +2416,6 @@ fn collect_entry_refs_unnarrowed(
                 collect_type_refs(ty, refs, &entry_shadows, aliases, definitions)
             }
         }
-        initializer_shadows.extend(declared_entry_names(std::slice::from_ref(entry)));
     }
 }
 
